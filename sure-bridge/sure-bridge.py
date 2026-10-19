@@ -185,6 +185,16 @@ def pea_rebuild_plan(data, rows):
                 errors.append("ISIN missing from TICKERS: %s (%s)" % (title, p.get("isin")))
     by_name = {norm(h["nom"]): isin for isin, h in held.items()}
 
+    def find_isin(security):
+        """Position matching a security label: exact, else a label that contains the other (long + short names)."""
+        name = norm(security)
+        if name in by_name:
+            return by_name[name]
+        found = {isin for known, isin in by_name.items() if name and (known in name or name in known)}
+        return found.pop() if len(found) == 1 else None
+
+    # Operations with a quantity that only move cash (the quantity is the number of securities concerned)
+    cash_only = ("COUPON", "DIVIDENDE", "AMORTISSEMENT")
     events, ops_by_isin = [], {}
     for r in sorted(rows, key=lambda r: (r.get("operation_date") or r.get("date") or "", r.get("date") or "")):
         op, qty, amount = norm(r.get("operation")), r.get("quantity") or 0, r.get("amount") or 0
@@ -194,17 +204,20 @@ def pea_rebuild_plan(data, rows):
         if not day_cash or (abs(amount) < 0.005 and not is_trade):
             continue  # events without cash (listing changes...)
         if is_trade:
-            isin = by_name.get(norm(r.get("security")))
+            isin = find_isin(r.get("security"))
             if not isin:
                 errors.append("security not among today's positions: %s" % r.get("security"))
                 continue
             kind = "buy" if op.startswith("ACHAT") else "sell"
             events.append({"day": day_trade, "kind": kind, "isin": isin, "qty": qty, "amount": abs(amount)})
             ops_by_isin.setdefault(isin, []).append((kind, qty, abs(amount)))
-        elif not qty:
+        elif not qty or op.startswith(cash_only):
             # first word only: the rest of a transfer label holds the account holder's name
             events.append({"day": day_cash, "kind": "deposit" if amount > 0 else "withdrawal", "amount": abs(amount),
                            "label": (op.split() or ["?"])[0][:20]})
+            if qty and op.startswith("AMORTISSEMENT"):
+                warnings.append("partial redemption counted as cash only, the number of securities is unchanged "
+                                "(check it against your positions)")
         else:
             errors.append("unknown operation with a quantity: %s" % op[:40])
     if not events:
@@ -242,10 +255,14 @@ def pea_rebuild_plan(data, rows):
                 mid = (low + high) / 2
                 low, high = (mid, high) if final_avg(mid) < h["pru"] else (low, mid)
             start_avg = (low + high) / 2
-            if abs(final_avg(start_avg) - h["pru"]) > 0.01:
-                warnings.append("%s: opening average cost does not reproduce today's PRU" % h["nom"])
+        # Compared in every case, also when nothing was held at the start (the buys alone then give the average)
+        replay_avg = final_avg(start_avg) if (q0 > 1e-9 or ops) else h["pru"]
+        if abs(replay_avg - h["pru"]) > max(0.01, 0.002 * h["pru"]):
+            warnings.append("%s: the replay gives an average cost of %.4f EUR, Bourse Direct says PRU %.4f EUR "
+                            "(fees or earlier lots missing from the history): Sure will show another gain for this line"
+                            % (h["nom"], replay_avg, h["pru"]))
         securities[isin] = {"nom": h["nom"], "qty_now": h["qty"], "pru": h["pru"], "qty_start": round(q0, 9),
-                            "avg_start": start_avg}
+                            "avg_start": start_avg, "avg_replay": replay_avg}
 
     flows = sum(e["amount"] * (1 if e["kind"] in ("deposit", "sell") else -1) for e in events)
     cash_start = cash_now - flows
@@ -258,7 +275,8 @@ def pea_rebuild_plan(data, rows):
                    "deposit": round(sum(s["qty_start"] * s["avg_start"] for s in securities.values())
                                     + max(cash_start, 0.0), 2),
                    "cash": round(cash_start, 2)}
-    return {"errors": errors, "warnings": warnings, "securities": securities, "opening": opening, "events": events,
+    return {"errors": errors, "warnings": list(dict.fromkeys(warnings)), "securities": securities, "opening": opening,
+            "events": events,
             "cash_now": cash_now, "held": held}
 
 
@@ -430,11 +448,11 @@ class Bridge:
         if plan["opening"]:
             print("   opening on %s: deposit %.2f EUR (holdings + %.2f EUR cash)" % (
                 plan["opening"]["day"], plan["opening"]["deposit"], plan["opening"]["cash"]))
-        for e in plan["events"][:15]:
+        for e in plan["events"][:60]:
             what = ("%g x %s" % (e["qty"], plan["securities"][e["isin"]]["nom"][:22])) if "isin" in e else e["label"]
             print("   %s  %-10s %-32s %10.2f EUR" % (e["day"], e["kind"], what, e["amount"]))
-        if len(plan["events"]) > 15:
-            print("   ... %d more" % (len(plan["events"]) - 15))
+        if len(plan["events"]) > 60:
+            print("   ... %d more" % (len(plan["events"]) - 60))
         for w in plan["warnings"]:
             print("WARNING: " + w)
         for e in plan["errors"]:
