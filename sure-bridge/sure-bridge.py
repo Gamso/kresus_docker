@@ -27,6 +27,7 @@ from datetime import date, timedelta
 ENV_FILE = "/etc/sure-bridge.env"
 STATE_FILE = "/var/lib/sure-bridge/state.json"
 ESALIA_FILE = "/var/lib/kresus/esalia-positions.json"
+ESALIA_HISTORY_FILE = "/var/lib/kresus/esalia-history.json"
 BD_GLOB = "/var/lib/kresus/boursedirect-positions-*.json"
 
 # ISIN -> Sure security (ticker|exchange|provider), only used when the security is not held yet
@@ -128,6 +129,35 @@ def match_kresus_account(data, spec, origin):
         raise RuntimeError("%d Kresus account(s) for %r (%s)%s" % (
             len(found), spec, origin, ": " + detail if detail else ""))
     return found[0]
+
+
+def pee_history_values(history):
+    """[(date, value)] of the PEE: parts held x unit price, for every date with a known price.
+
+    history is the esalia-history.json export: "movements" (date, dispositif, support, sens, parts) and
+    "supports" (prices: [date, unit price]). SOUSCRIPTION adds parts, RACHAT removes them; the result matches
+    the current positions. The price used on a date is the last one known on or before it.
+    """
+    movements = sorted(history.get("movements", []), key=lambda m: m["date"])
+    if not movements:
+        return []
+    prices = {sid: sorted(s.get("prices", [])) for sid, s in history.get("supports", {}).items()}
+    dates = sorted({d for pts in prices.values() for d, _ in pts if d >= movements[0]["date"]})
+    parts, last, cursor, out, i = {}, {}, {sid: 0 for sid in prices}, [], 0
+    for day in dates:
+        while i < len(movements) and movements[i]["date"] <= day:
+            m = movements[i]
+            key = (m.get("dispositif"), m["support"])
+            parts[key] = parts.get(key, 0) + (1 if m.get("sens") == "SOUSCRIPTION" else -1) * m["parts"]
+            i += 1
+        for sid, pts in prices.items():
+            while cursor[sid] < len(pts) and pts[cursor[sid]][0] <= day:
+                last[sid] = pts[cursor[sid]][1]
+                cursor[sid] += 1
+        value = sum(q * last.get(sid, 0) for (_, sid), q in parts.items() if abs(q) > 1e-9)
+        if value > 0:
+            out.append((day, round(value, 2)))
+    return out
 
 
 def find_kresus_account(data, cfg_key, default):
@@ -272,7 +302,36 @@ class Bridge:
             return self.sync_pee_lines(account_id)
         return self.sync_pee_valuation(account_id)
 
+    def backfill_pee_history(self, account_id):
+        """PEE_HISTORY=1: one valuation per past date (parts held x unit price), from the first operation on."""
+        try:
+            with open(ESALIA_HISTORY_FILE) as f:
+                history = json.load(f)
+        except (OSError, ValueError):
+            print("PEE history: no export yet (esalia-history.json), run an Esalia sync in Kresus first")
+            return
+        st = self.state.setdefault("pee", {})
+        until, today = st.get("history_until", ""), date.today().isoformat()
+        points = [(d, v) for d, v in pee_history_values(history) if until < d < today]
+        if not points:
+            print("PEE history: already up to date")
+            return
+        print(("[dry run] " if self.dry else "") + "PEE history: %d valuation(s) from %s to %s"
+              % (len(points), points[0][0], points[-1][0]))
+        if self.dry:
+            return
+        for n, (day, value) in enumerate(points):
+            sure("POST", "/api/v1/valuations", {"valuation": {
+                "account_id": account_id, "amount": value, "date": day,
+                "notes": "Rebuilt from the Esalia operations and unit price history"}, "upsert": True})
+            st["history_until"] = day
+            if n % 50 == 49:
+                self.commit()
+        self.commit()
+
     def sync_pee_valuation(self, account_id):
+        if CFG.get("PEE_HISTORY", "0") == "1":
+            self.backfill_pee_history(account_id)
         # The export keys (valeur, plus_value, parts, fonds...) are written by the esalia module
         with open(ESALIA_FILE) as f:
             data = json.load(f)
@@ -432,9 +491,31 @@ class Bridge:
 
 def main():
     ap = argparse.ArgumentParser(description="Kresus/Woob to Sure bridge")
-    ap.add_argument("command", choices=["accounts", "sync"])
+    ap.add_argument("command", choices=["accounts", "sync", "pee-history"])
     ap.add_argument("--dry-run", action="store_true", help="show what would be sent, send nothing")
     args = ap.parse_args()
+
+    if args.command == "pee-history":
+        # Preview only: reads the Esalia exports, computes the curve, contacts nothing (neither Sure nor Kresus)
+        with open(ESALIA_HISTORY_FILE) as f:
+            points = pee_history_values(json.load(f))
+        print("PEE history: %d date(s)" % len(points))
+        for day, value in (points if len(points) <= 6 else points[:3] + [("...", None)] + points[-3:]):
+            print("  %s  %s" % (day, "" if value is None else "%.2f EUR" % value))
+        moves = sorted(((abs(b[1] / a[1] - 1), b[0]) for a, b in zip(points, points[1:]) if a[1]), reverse=True)
+        if moves:
+            print("Largest one-day moves (a jump far above the usual ones would mean a wrong parts count):")
+            for change, day in moves[:5]:
+                print("  %s  %.2f%%" % (day, 100 * change))
+        try:
+            with open(ESALIA_FILE) as f:
+                today = json.load(f)
+            total = round(sum(p["valeur"] for p in today["positions"]), 2)
+            print("Valuation from today's positions (%s): %.2f EUR; last point of the curve: %.2f EUR (%s)"
+                  % (today["date"], total, points[-1][1] if points else 0, points[-1][0] if points else "-"))
+        except (OSError, ValueError, KeyError):
+            print("(no esalia-positions.json to compare with)")
+        return 0
 
     if args.command == "accounts":
         print("Sure accounts:")
