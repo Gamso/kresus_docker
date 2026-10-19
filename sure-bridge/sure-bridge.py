@@ -27,7 +27,9 @@ from datetime import date, timedelta
 ENV_FILE = "/etc/sure-bridge.env"
 STATE_FILE = "/var/lib/sure-bridge/state.json"
 ESALIA_FILE = "/var/lib/kresus/esalia-positions.json"
+ESALIA_HISTORY_FILE = "/var/lib/kresus/esalia-history.json"
 BD_GLOB = "/var/lib/kresus/boursedirect-positions-*.json"
+BD_HISTORY = "/var/lib/kresus/boursedirect-history-%s.json"
 
 # ISIN -> Sure security (ticker|exchange|provider), only used when the security is not held yet
 TICKERS = {
@@ -128,6 +130,136 @@ def match_kresus_account(data, spec, origin):
         raise RuntimeError("%d Kresus account(s) for %r (%s)%s" % (
             len(found), spec, origin, ": " + detail if detail else ""))
     return found[0]
+
+
+def pee_history_values(history):
+    """[(date, value)] of the PEE: parts held x unit price, for every date with a known price.
+
+    history is the esalia-history.json export: "movements" (date, dispositif, support, sens, parts) and
+    "supports" (prices: [date, unit price]). SOUSCRIPTION adds parts, RACHAT removes them; the result matches
+    the current positions. The price used on a date is the last one known on or before it.
+    """
+    movements = sorted(history.get("movements", []), key=lambda m: m["date"])
+    if not movements:
+        return []
+    prices = {sid: sorted(s.get("prices", [])) for sid, s in history.get("supports", {}).items()}
+    dates = sorted({d for pts in prices.values() for d, _ in pts if d >= movements[0]["date"]})
+    parts, last, cursor, out, i = {}, {}, {sid: 0 for sid in prices}, [], 0
+    for day in dates:
+        while i < len(movements) and movements[i]["date"] <= day:
+            m = movements[i]
+            key = (m.get("dispositif"), m["support"])
+            parts[key] = parts.get(key, 0) + (1 if m.get("sens") == "SOUSCRIPTION" else -1) * m["parts"]
+            i += 1
+        for sid, pts in prices.items():
+            while cursor[sid] < len(pts) and pts[cursor[sid]][0] <= day:
+                last[sid] = pts[cursor[sid]][1]
+                cursor[sid] += 1
+        value = sum(q * last.get(sid, 0) for (_, sid), q in parts.items() if abs(q) > 1e-9)
+        if value > 0:
+            out.append((day, round(value, 2)))
+    return out
+
+
+def pea_rebuild_plan(data, rows):
+    """Replay plan for the PEA, from the history rows and today's positions.
+
+    The history page only covers a window (about two months). The state at the start of that window is rebuilt
+    backwards from today's positions: quantity = quantity now - bought + sold, and the opening average cost is
+    solved so that replaying the buys and sells gives today's average cost (PRU). The opening cash is today's
+    cash minus the net cash flows of the window. Returns a dict: errors, warnings, securities, opening,
+    events (chronological), cash_now and held (today's positions, as sync_pea stores them).
+    """
+    def norm(text):
+        return " ".join(html.unescape(text or "").upper().split())
+
+    errors, warnings, held, cash_now = [], [], {}, 0.0
+    for p in data["positions"]:
+        if p.get("isin") == "XX-liquidity":
+            cash_now = p.get("valeur") or 0.0
+        elif p.get("quantite"):
+            title = html.unescape(p.get("libelle") or "?")
+            if p.get("isin") in TICKERS:
+                held[p["isin"]] = {"qty": p["quantite"], "pru": p["pru"], "cours": p.get("cours"), "nom": title}
+            else:
+                errors.append("ISIN missing from TICKERS: %s (%s)" % (title, p.get("isin")))
+    by_name = {norm(h["nom"]): isin for isin, h in held.items()}
+
+    events, ops_by_isin = [], {}
+    for r in sorted(rows, key=lambda r: (r.get("operation_date") or r.get("date") or "", r.get("date") or "")):
+        op, qty, amount = norm(r.get("operation")), r.get("quantity") or 0, r.get("amount") or 0
+        day_trade = r.get("operation_date") or r.get("date")
+        day_cash = r.get("date") or r.get("operation_date")
+        is_trade = op.startswith(("ACHAT", "VENTE")) and qty
+        if not day_cash or (abs(amount) < 0.005 and not is_trade):
+            continue  # events without cash (listing changes...)
+        if is_trade:
+            isin = by_name.get(norm(r.get("security")))
+            if not isin:
+                errors.append("security not among today's positions: %s" % r.get("security"))
+                continue
+            kind = "buy" if op.startswith("ACHAT") else "sell"
+            events.append({"day": day_trade, "kind": kind, "isin": isin, "qty": qty, "amount": abs(amount)})
+            ops_by_isin.setdefault(isin, []).append((kind, qty, abs(amount)))
+        elif not qty:
+            # first word only: the rest of a transfer label holds the account holder's name
+            events.append({"day": day_cash, "kind": "deposit" if amount > 0 else "withdrawal", "amount": abs(amount),
+                           "label": (op.split() or ["?"])[0][:20]})
+        else:
+            errors.append("unknown operation with a quantity: %s" % op[:40])
+    if not events:
+        errors.append("no operation in the history file")
+    rank = {"deposit": 0, "sell": 1, "buy": 2, "withdrawal": 3}
+    events.sort(key=lambda e: (e["day"], rank[e["kind"]]))
+
+    securities = {}
+    for isin, h in held.items():
+        ops = ops_by_isin.get(isin, [])
+        bought = sum(q for k, q, _ in ops if k == "buy")
+        sold = sum(q for k, q, _ in ops if k == "sell")
+        q0 = h["qty"] - bought + sold
+        if q0 < -1e-9:
+            errors.append("negative opening quantity for %s: the history window does not explain the position" % h["nom"])
+            q0 = 0.0
+
+        def final_avg(avg, q0=q0, ops=ops):
+            q = q0
+            for kind, n, amount in ops:
+                if kind == "buy":
+                    avg, q = (q * avg + amount) / (q + n), q + n
+                else:
+                    q -= n
+            return avg
+
+        start_avg = 0.0
+        if q0 > 1e-9:
+            low, high = 0.0, max(h["pru"] * 20, 1.0)
+            for _ in range(60):
+                if final_avg(high) >= h["pru"]:
+                    break
+                high *= 2
+            for _ in range(100):
+                mid = (low + high) / 2
+                low, high = (mid, high) if final_avg(mid) < h["pru"] else (low, mid)
+            start_avg = (low + high) / 2
+            if abs(final_avg(start_avg) - h["pru"]) > 0.01:
+                warnings.append("%s: opening average cost does not reproduce today's PRU" % h["nom"])
+        securities[isin] = {"nom": h["nom"], "qty_now": h["qty"], "pru": h["pru"], "qty_start": round(q0, 9),
+                            "avg_start": start_avg}
+
+    flows = sum(e["amount"] * (1 if e["kind"] in ("deposit", "sell") else -1) for e in events)
+    cash_start = cash_now - flows
+    if cash_start < -0.01:
+        warnings.append("negative opening cash (%.2f EUR): the history may be incomplete" % cash_start)
+    first_day = min((e["day"] for e in events), default=None)
+    opening = None
+    if first_day:
+        opening = {"day": (date.fromisoformat(first_day) - timedelta(days=1)).isoformat(),
+                   "deposit": round(sum(s["qty_start"] * s["avg_start"] for s in securities.values())
+                                    + max(cash_start, 0.0), 2),
+                   "cash": round(cash_start, 2)}
+    return {"errors": errors, "warnings": warnings, "securities": securities, "opening": opening, "events": events,
+            "cash_now": cash_now, "held": held}
 
 
 def find_kresus_account(data, cfg_key, default):
@@ -272,7 +404,115 @@ class Bridge:
             return self.sync_pee_lines(account_id)
         return self.sync_pee_valuation(account_id)
 
+    def rebuild_pea(self, account_id, yes):
+        """Replays the PEA from the history file with the real dates. Returns the exit code."""
+        files = sorted(glob.glob(BD_GLOB))
+        if not files:
+            print("PEA: no Bourse Direct positions export")
+            return 1
+        with open(files[0]) as f:
+            data = json.load(f)
+        try:
+            with open(BD_HISTORY % data["compte"]) as f:
+                rows = json.load(f)["rows"]
+        except (OSError, ValueError, KeyError):
+            print("PEA: no history export yet (boursedirect-history-%s.json): run a Bourse Direct sync in Kresus first"
+                  % data.get("compte"))
+            return 1
+        plan = pea_rebuild_plan(data, rows)
+
+        print("PEA replay: %d operation(s) from %s to %s" % (
+            len(plan["events"]), plan["events"][0]["day"] if plan["events"] else "-",
+            plan["events"][-1]["day"] if plan["events"] else "-"))
+        for s in plan["securities"].values():
+            print("   %-26s now %g (PRU %.4f)  -> start of window: %g at %.4f" % (
+                s["nom"][:26], s["qty_now"], s["pru"], s["qty_start"], s["avg_start"]))
+        if plan["opening"]:
+            print("   opening on %s: deposit %.2f EUR (holdings + %.2f EUR cash)" % (
+                plan["opening"]["day"], plan["opening"]["deposit"], plan["opening"]["cash"]))
+        for e in plan["events"][:15]:
+            what = ("%g x %s" % (e["qty"], plan["securities"][e["isin"]]["nom"][:22])) if "isin" in e else e["label"]
+            print("   %s  %-10s %-32s %10.2f EUR" % (e["day"], e["kind"], what, e["amount"]))
+        if len(plan["events"]) > 15:
+            print("   ... %d more" % (len(plan["events"]) - 15))
+        for w in plan["warnings"]:
+            print("WARNING: " + w)
+        for e in plan["errors"]:
+            print("ERROR: " + e)
+        if plan["errors"]:
+            print("Nothing written: fix the errors above first.")
+            return 1
+
+        held = [h for h in sure("GET", "/api/v1/holdings?account_id=%s&per_page=100" % account_id).get("holdings", [])
+                if h.get("qty")]
+        print("Sure PEA account: %s" % ("EMPTY, ready" if not held else "NOT empty (%d holding(s))" % len(held)))
+        if self.dry:
+            print("[dry run] nothing written")
+            return 0
+        if not yes:
+            print("Refused: this writes to Sure. Use --dry-run to preview, then --yes to write.")
+            return 1
+        if held:
+            print("Refused: empty the PEA account in Sure first (delete its trades, or recreate the account "
+                  "with the same name and a balance of 0), otherwise the positions would be counted twice.")
+            return 1
+
+        opening = plan["opening"]
+        if opening["deposit"] > 0:
+            self.post("/api/v1/trades", self.trade(account_id, opening["day"], type="deposit",
+                                                   amount=opening["deposit"]),
+                      "PEA: opening deposit of %.2f EUR" % opening["deposit"])
+        for isin, s in plan["securities"].items():
+            if s["qty_start"] > 1e-9:
+                self.post("/api/v1/trades", self.trade(account_id, opening["day"], type="buy", qty=round(s["qty_start"], 6),
+                                                       price=round(s["avg_start"], 6), ticker=TICKERS[isin]),
+                          "PEA: opening position of %g %s at %.4f EUR" % (s["qty_start"], s["nom"], s["avg_start"]))
+        for e in plan["events"]:
+            if e["kind"] in ("deposit", "withdrawal"):
+                self.post("/api/v1/trades", self.trade(account_id, e["day"], type=e["kind"], amount=round(e["amount"], 2)),
+                          "PEA: %s of %.2f EUR (%s)" % (e["kind"], e["amount"], e["label"]))
+            else:
+                name = plan["securities"][e["isin"]]["nom"]
+                self.post("/api/v1/trades", self.trade(account_id, e["day"], type=e["kind"], qty=round(e["qty"], 6),
+                                                       price=round(e["amount"] / e["qty"], 6), ticker=TICKERS[e["isin"]]),
+                          "PEA: %s of %g %s at %.4f EUR on %s" % (e["kind"], e["qty"], name, e["amount"] / e["qty"], e["day"]))
+        # From now on sync_pea only sends the differences from today's positions
+        self.state["pea"] = {"positions": plan["held"], "cash": round(plan["cash_now"], 2), "last_date": data["date"],
+                             "rebuilt": date.today().isoformat()}
+        self.commit()
+        print("PEA: replay done, state updated.")
+        return 0
+
+    def backfill_pee_history(self, account_id):
+        """PEE_HISTORY=1: one valuation per past date (parts held x unit price), from the first operation on."""
+        try:
+            with open(ESALIA_HISTORY_FILE) as f:
+                history = json.load(f)
+        except (OSError, ValueError):
+            print("PEE history: no export yet (esalia-history.json), run an Esalia sync in Kresus first")
+            return
+        st = self.state.setdefault("pee", {})
+        until, today = st.get("history_until", ""), date.today().isoformat()
+        points = [(d, v) for d, v in pee_history_values(history) if until < d < today]
+        if not points:
+            print("PEE history: already up to date")
+            return
+        print(("[dry run] " if self.dry else "") + "PEE history: %d valuation(s) from %s to %s"
+              % (len(points), points[0][0], points[-1][0]))
+        if self.dry:
+            return
+        for n, (day, value) in enumerate(points):
+            sure("POST", "/api/v1/valuations", {"valuation": {
+                "account_id": account_id, "amount": value, "date": day,
+                "notes": "Rebuilt from the Esalia operations and unit price history"}, "upsert": True})
+            st["history_until"] = day
+            if n % 50 == 49:
+                self.commit()
+        self.commit()
+
     def sync_pee_valuation(self, account_id):
+        if CFG.get("PEE_HISTORY", "0") == "1":
+            self.backfill_pee_history(account_id)
         # The export keys (valeur, plus_value, parts, fonds...) are written by the esalia module
         with open(ESALIA_FILE) as f:
             data = json.load(f)
@@ -432,9 +672,32 @@ class Bridge:
 
 def main():
     ap = argparse.ArgumentParser(description="Kresus/Woob to Sure bridge")
-    ap.add_argument("command", choices=["accounts", "sync"])
+    ap.add_argument("command", choices=["accounts", "sync", "pee-history", "pea-rebuild"])
     ap.add_argument("--dry-run", action="store_true", help="show what would be sent, send nothing")
+    ap.add_argument("--yes", action="store_true", help="pea-rebuild: really write to Sure (after a dry run)")
     args = ap.parse_args()
+
+    if args.command == "pee-history":
+        # Preview only: reads the Esalia exports, computes the curve, contacts nothing (neither Sure nor Kresus)
+        with open(ESALIA_HISTORY_FILE) as f:
+            points = pee_history_values(json.load(f))
+        print("PEE history: %d date(s)" % len(points))
+        for day, value in (points if len(points) <= 6 else points[:3] + [("...", None)] + points[-3:]):
+            print("  %s  %s" % (day, "" if value is None else "%.2f EUR" % value))
+        moves = sorted(((abs(b[1] / a[1] - 1), b[0]) for a, b in zip(points, points[1:]) if a[1]), reverse=True)
+        if moves:
+            print("Largest one-day moves (a jump far above the usual ones would mean a wrong parts count):")
+            for change, day in moves[:5]:
+                print("  %s  %.2f%%" % (day, 100 * change))
+        try:
+            with open(ESALIA_FILE) as f:
+                today = json.load(f)
+            total = round(sum(p["valeur"] for p in today["positions"]), 2)
+            print("Valuation from today's positions (%s): %.2f EUR; last point of the curve: %.2f EUR (%s)"
+                  % (today["date"], total, points[-1][1] if points else 0, points[-1][0] if points else "-"))
+        except (OSError, ValueError, KeyError):
+            print("(no esalia-positions.json to compare with)")
+        return 0
 
     if args.command == "accounts":
         print("Sure accounts:")
@@ -444,6 +707,14 @@ def main():
         for k in kresus_accounts(kresus_all()):
             print("  - %s:%r: %.2f EUR (%s)" % (k["vendor"], k["label"], k["balance"], k["src"]))
         return 0
+
+    if args.command == "pea-rebuild":
+        name = (CFG.get("SURE_ACCOUNT_PEA") or "").strip().lower()
+        account = {x["name"].strip().lower(): x["id"] for x in sure_accounts()}.get(name)
+        if not account:
+            print("ERROR: Sure account %r not found (SURE_ACCOUNT_PEA)" % CFG.get("SURE_ACCOUNT_PEA"))
+            return 1
+        return Bridge(args.dry_run).rebuild_pea(account, args.yes)
 
     bridge = Bridge(args.dry_run)
     ids = {x["name"].strip().lower(): x["id"] for x in sure_accounts()}

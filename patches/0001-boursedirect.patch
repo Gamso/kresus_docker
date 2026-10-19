@@ -1,0 +1,397 @@
+diff --git a/modules/boursedirect/avis.py b/modules/boursedirect/avis.py
+new file mode 100644
+index 000000000..de4dc830b
+--- /dev/null
++++ b/modules/boursedirect/avis.py
+@@ -0,0 +1,169 @@
++# Copyright(C) 2026
++#
++# This file is part of a Woob module.
++#
++# This Woob module is free software: you can redistribute it and/or modify
++# it under the terms of the GNU Lesser General Public License as published by
++# the Free Software Foundation, either version 3 of the License, or
++# (at your option) any later version.
++#
++# This Woob module is distributed in the hope that it will be useful,
++# but WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++# GNU Lesser General Public License for more details.
++#
++# You should have received a copy of the GNU Lesser General Public License
++# along with this Woob module. If not, see <http://www.gnu.org/licenses/>.
++
++"""Parser of the "Avis d'Opération" pages (releveOpe.php), one page per day with operations."""
++
++import re
++from datetime import datetime
++from urllib.parse import parse_qs
++
++import lxml.html
++
++LINK_RE = re.compile(r"releveOpe\.php\?([^'\"]+)")
++DATE_RE = re.compile(r"^\d{2}/\d{2}/\d{4}$")
++ISIN_RE = re.compile(r"^[A-Z]{2}[A-Z0-9]{9}\d$")
++AMOUNT_RE = re.compile(r"^[+-]?\d[\d\s.]*(?:,\d+)?$")
++KEY_VALUE_RE = re.compile(r"^([^:]+?)\s*:\s*([+-]?\d[\d\s.]*(?:,\d+)?)$")
++END_RE = re.compile(r"^Sous réserve de bonne fin", re.I)
++
++
++def avis_links(html, year=None, month=None):
++    """Query strings of the confirmations listed by the calendar page, one per day, in page order.
++
++    The page always lists the latest confirmations whatever month is asked: when year and month are given, only
++    the links of that month are kept.
++    """
++    seen, out = set(), []
++    for query in LINK_RE.findall(html):
++        query = query.replace("&amp;", "&")
++        if query in seen:
++            continue
++        params = parse_qs(query)
++        if year is not None and (params.get("year") != [str(year)] or params.get("month") not in ([str(month)], ["%02d" % month])):
++            continue
++        seen.add(query)
++        out.append(query)
++    return out
++
++
++def _number(text):
++    return float(text.replace(" ", "").replace("\xa0", "").replace(".", "").replace(",", "."))
++
++
++def _is_label(text):
++    """Operation labels are upper case (ACHAT COMPTANT, COUPONS...); "Heure Execution: ..." only adds details."""
++    return text == text.upper() and bool(re.search(r"[A-Z]", text)) and not KEY_VALUE_RE.match(text) and not AMOUNT_RE.match(text)
++
++
++def _cells(tr):
++    """(text, column index among all the cells of the row), the empty cells being counted but not returned."""
++    out = []
++    for idx, td in enumerate(tr.xpath("./td|./th")):
++        text = " ".join(td.text_content().split())
++        if text:
++            out.append((text, idx))
++    return out
++
++
++NO_CASH_RE = re.compile(r"^(ATTRIBUTION|CHANGEMENT)", re.I)
++
++
++def _sign(operation):
++    """Cash direction from the label: the page nests its tables, so the debit/credit column is not readable."""
++    if re.match(r"^(ACHAT|FRAIS|DROITS|TAXE|TTF|RETRAIT|DESINVESTISSEMENT|REMBOURSEMENT ESPECES)", operation, re.I):
++        return -1
++    return 1
++
++
++def _operation(date, lines):
++    """One operation from the rows of its block. lines: list of lists of (text, column)."""
++    texts = [t for t, _ in lines[0]]
++    row = {
++        "date": date,
++        "operation": texts[0],
++        "isin": None,
++        "security": None,
++        "quantity": None,
++        "price": None,
++        "gross": None,
++        "commission": None,
++        "amount": None,
++    }
++    for text in texts[1:]:
++        if ISIN_RE.match(text):
++            row["isin"] = text
++        elif row["security"] is None:
++            row["security"] = text
++    named = {"QUANTITE": "quantity", "PX UN.BRUT": "price", "COURS": "price", "BRUT": "gross", "COMMISSION": "commission"}
++    for cells in lines[1:]:
++        for text, _ in cells:
++            m = KEY_VALUE_RE.match(text)
++            if m:
++                key = m.group(1).strip().upper()
++                if key in named:
++                    row[named[key]] = _number(m.group(2))
++    if row["price"] is None and row["gross"] is not None and row["quantity"]:
++        row["price"] = round(abs(row["gross"]) / abs(row["quantity"]), 4)
++    if re.match(r"^(ACHAT|VENTE)", row["operation"], re.I):
++        for k in ("quantity", "price", "gross"):
++            if row[k] is not None:
++                row[k] = abs(row[k])
++    return row
++
++
++def _assign_amounts(operations, amounts):
++    """The amounts are listed after all the operations, in their order, apart from them (debit/credit columns).
++
++    Each amount goes to the first operation still without one that it can belong to: close to its gross when it
++    has one, any cash movement otherwise. Left over operations with a gross fall back on it (fees unknown).
++    """
++    for value in amounts:
++        for op in operations:
++            if op["amount"] is not None or NO_CASH_RE.match(op["operation"]):
++                continue
++            gross = op["gross"]
++            if gross is not None and abs(value - abs(gross)) > max(1.5, 0.03 * abs(gross)):
++                continue
++            op["amount"] = _sign(op["operation"]) * value
++            break
++    for op in operations:
++        if op["amount"] is None and op["gross"] is not None and not NO_CASH_RE.match(op["operation"]):
++            op["amount"] = _sign(op["operation"]) * abs(op["gross"])
++
++
++def parse_avis(html):
++    """Operations of one confirmation page, as dicts (date as ISO string, amount signed: debit < 0 < credit)."""
++    doc = lxml.html.fromstring(html)
++    for el in doc.xpath("//script|//style"):
++        el.drop_tree()
++    rows = []
++    for tr in doc.xpath("//tr"):
++        if tr.xpath(".//tr"):
++            continue  # leaf rows only
++        cells = _cells(tr)
++        if cells:
++            rows.append(cells)
++
++    blocks, amounts, date = [], [], None
++    for cells in rows:
++        first = cells[0][0]
++        if END_RE.match(first):
++            break
++        if len(cells) == 1 and DATE_RE.match(first):
++            date = datetime.strptime(first, "%d/%m/%Y").date().isoformat()
++        elif date is None:
++            continue
++        elif len(cells) == 1 and AMOUNT_RE.match(first):
++            amounts.append(abs(_number(first)))
++        elif _is_label(first):
++            blocks.append((date, [cells]))
++        elif blocks:
++            blocks[-1][1].append(cells)
++
++    operations = [_operation(day, lines) for day, lines in blocks]
++    _assign_amounts(operations, amounts)
++    return operations
+diff --git a/modules/boursedirect/browser.py b/modules/boursedirect/browser.py
+index f08cb1ff3..eaa6364e3 100644
+--- a/modules/boursedirect/browser.py
++++ b/modules/boursedirect/browser.py
+@@ -53,6 +53,8 @@
+ 
+ class BoursedirectBrowser(TwoFactorBrowser):
+     BASEURL = "https://www.boursedirect.fr"
++    # The legacy /priv/ pages can take longer than Woob's 10 s default to answer right after a fresh login
++    TIMEOUT = 60.0
+     HAS_CREDENTIALS_ONLY = True
+ 
+     login = URL(r"/hub/auth/login", LoginPage)
+@@ -221,12 +223,195 @@ def handle_totp(self):
+     def handle_otp_sms(self):
+         self.do_twofa_validation(self.otp_sms, self.validate_otp_sms)
+ 
++    def _export_positions(self, account):
++        import json
++        import os
++        import time
++        from decimal import Decimal
++
++        def num(v):
++            return float(v) if isinstance(v, (int, float, Decimal)) else None
++
++        try:
++            out = []
++            for inv in self.iter_investment(account):
++                out.append({
++                    "libelle": str(inv.label) if isinstance(inv.label, str) else None,
++                    "isin": inv.code if isinstance(inv.code, str) else None,
++                    "quantite": num(inv.quantity),
++                    "pru": num(inv.unitprice),
++                    "cours": num(inv.unitvalue),
++                    "valeur": num(inv.valuation),
++                    "plus_value": num(inv.diff),
++                })
++            path = "/var/lib/kresus/boursedirect-positions-%s.json" % account.id
++            with open(path + ".tmp", "w") as f:
++                json.dump({"date": time.strftime("%Y-%m-%d"), "compte": str(account.id),
++                           "libelle": str(account.label), "positions": out}, f, ensure_ascii=False, indent=1)
++            os.replace(path + ".tmp", path)
++        except Exception as e:
++            try:
++                with open("/var/lib/kresus/boursedirect-debug.txt", "a") as f:
++                    f.write("%s export err=%s: %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), type(e).__name__, e))
++            except OSError:
++                pass
++
++    def _export_history(self, account):
++        """Writes the rows of the account history page to boursedirect-history-<account>.json.
++
++        The page only shows about two months, so each export is merged with the previous file: rows that scrolled
++        out of the window are kept. Used by the bridge to replay the operations with their real dates.
++        """
++        import json
++        import os
++        from collections import Counter
++        from decimal import Decimal
++
++        if account.type not in (account.TYPE_PEA, account.TYPE_MARKET):
++            return
++
++        def num(value):
++            return float(value) if isinstance(value, (int, float, Decimal)) else None
++
++        def key(row):
++            return tuple(row[k] for k in ("date", "operation_date", "operation", "security", "quantity", "price", "amount"))
++
++        try:
++            self.history.go(nc=account._select)
++            rows = []
++            for tr in self.page.iter_history():
++                investment = tr.investments[0] if isinstance(tr.investments, list) and tr.investments else None
++                rows.append(
++                    {
++                        "date": tr.date.isoformat() if tr.date else None,  # allocation date
++                        "operation_date": tr.rdate.isoformat() if tr.rdate else None,
++                        "operation": tr._operation,
++                        "security": tr._security,
++                        "quantity": num(investment.quantity) if investment else None,
++                        "price": num(investment.unitvalue) if investment else None,
++                        "amount": num(tr.amount),
++                    }
++                )
++
++            path = "/var/lib/kresus/boursedirect-history-%s.json" % account.id
++            try:
++                with open(path) as f:
++                    previous = json.load(f).get("rows", [])
++            except (OSError, ValueError):
++                previous = []
++
++            # Same row seen in both exports: keep it once. Identical rows on the same day count separately.
++            seen, merged = Counter(key(r) for r in rows), list(rows)
++            old_count = Counter()
++            for row in previous:
++                k = key(row)
++                old_count[k] += 1
++                if old_count[k] > seen[k]:
++                    merged.append(row)
++                    seen[k] += 1
++            merged.sort(key=lambda r: (r["date"] or "", r["operation_date"] or ""))
++
++            with open(path + ".tmp", "w") as f:
++                json.dump({"account": str(account.id), "rows": merged}, f, ensure_ascii=False, indent=1)
++            os.replace(path + ".tmp", path)
++        except Exception as e:  # the history is a bonus: never break the account list for it
++            self.logger.warning("export history failed: %s: %s", type(e).__name__, e)
++
++    def _export_avis(self, account):
++        """One-off backfill of the history from the trade confirmations (avis d'opéré).
++
++        The history page only shows about two months, the confirmations go back much further. They are listed as a
++        calendar, one month per page (&year=&month=), one page per day with operations. On the first sync (no
++        boursedirect-avis-<account>.json yet) the walk goes back until 6 months in a row hold no confirmation, the
++        raw result is saved, and the operations older than the history page are added to the history file, which
++        _export_history keeps merging afterwards. Later syncs only use the history page. BOURSEDIRECT_AVIS=1 forces
++        a new walk.
++        """
++        import json
++        import os
++        from datetime import date
++
++        from .avis import avis_links, parse_avis
++
++        if account.type not in (account.TYPE_PEA, account.TYPE_MARKET):
++            return
++        path = "/var/lib/kresus/boursedirect-avis-%s.json" % account.id
++        history_path = "/var/lib/kresus/boursedirect-history-%s.json" % account.id
++        if os.path.exists(path) and os.environ.get("BOURSEDIRECT_AVIS") != "1":
++            return
++
++        try:
++            with open(history_path) as f:
++                history = json.load(f)
++        except (OSError, ValueError):
++            return  # no history export yet: try again on the next sync rather than mark the backfill as done
++
++        try:
++            today = date.today()
++            year, month, empty = today.year, today.month, 0
++            rows = []
++            while empty < 6 and year >= 2000:
++                key = "%d-%02d" % (year, month)
++                page = self.open("/priv/new/avis-operes.php?nc=%s&year=%d&month=%02d" % (account._select, year, month))
++                month_rows = []
++                for query in avis_links(page.text, year, month):
++                    month_rows.extend(parse_avis(self.open("/priv/new/releveOpe.php?" + query).text))
++                for row in month_rows:
++                    row["month"] = key
++                rows.extend(month_rows)
++                empty = 0 if month_rows else empty + 1
++                year, month = (year, month - 1) if month > 1 else (year - 1, 12)
++            rows.sort(key=lambda r: (r["date"], r["operation"], r["security"] or ""))
++
++            with open(path + ".tmp", "w") as f:
++                json.dump({"account": str(account.id), "rows": rows}, f, ensure_ascii=False, indent=1)
++            os.replace(path + ".tmp", path)
++
++            # Same row schema as the history page; only what the page can no longer show
++            old_rows = history.get("rows", [])
++            first = min((r["operation_date"] or r["date"] for r in old_rows if r.get("date") or r.get("operation_date")),
++                        default="9999-12-31")
++            added = [
++                {
++                    "date": r["date"],
++                    "operation_date": r["date"],
++                    "operation": r["operation"],
++                    "security": r["security"],
++                    "quantity": r["quantity"],
++                    "price": r["price"],
++                    "amount": r["amount"],
++                }
++                for r in rows
++                if r["date"] < first
++            ]
++            merged = added + old_rows
++            merged.sort(key=lambda r: (r["date"] or "", r["operation_date"] or ""))
++            history["rows"] = merged
++            with open(history_path + ".tmp", "w") as f:
++                json.dump(history, f, ensure_ascii=False, indent=1)
++            os.replace(history_path + ".tmp", history_path)
++            self.logger.info("avis backfill: %d operation(s) found, %d added before %s", len(rows), len(added), first)
++        except Exception as e:  # a bonus: never break the account list for it
++            self.logger.warning("export avis failed: %s: %s", type(e).__name__, e)
++
+     @need_login
+     def iter_accounts(self):
+         self.accounts.go()
++        if self.page is None and "legacy-token-expired" in self.url:
++            # Session restauree mais jeton de l'espace legacy expire : reconnexion
++            self.do_login()
++            self.accounts.go()
++        if self.page is None:
++            from urllib.parse import urlsplit
++            u = urlsplit(self.url)
++            hops = [urlsplit(r.url).path for r in self.response.history]
++            raise AssertionError("Boursedirect: page inconnue %s%s [%s] via=%s" % (u.netloc, u.path, self.response.status_code, hops))
+         for account in self.page.iter_accounts():
+             self.accounts.go(nc=account._select)
+             self.page.fill_account(obj=account)
++            self._export_positions(account)
++            self._export_history(account)
++            self._export_avis(account)
+             yield account
+ 
+     @need_login
+diff --git a/modules/boursedirect/pages.py b/modules/boursedirect/pages.py
+index ebf6403da..5f5de5d7d 100644
+--- a/modules/boursedirect/pages.py
++++ b/modules/boursedirect/pages.py
+@@ -402,6 +402,8 @@ class item(ItemElement):
+             obj_rdate = Date(CleanText(TableCell("rdate")), dayfirst=True)  # Date opération
+             obj_label = Format("%s - %s", CleanText(TableCell("investment_label")), CleanText(TableCell("label")))
+             obj_amount = CleanDecimal.French(TableCell("amount"))
++            obj__operation = CleanText(TableCell("label"))
++            obj__security = CleanText(TableCell("investment_label"))
+ 
+             def obj_investments(self):
+                 if CleanDecimal.French(TableCell("unitvalue"), default=None) is None:

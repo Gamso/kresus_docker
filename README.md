@@ -6,7 +6,7 @@ An image that bundles:
 |---|---|
 | **Kresus** | npm release pinned in the Dockerfile (`0.26.0`, build-arg `KRESUS_VERSION`) |
 | **Woob** | https://gitlab.com/woob/woob at the master commit the patches were made against (`3bc0f159c`, build-arg `WOOB_REF`: branch, tag or full SHA) |
-| **Patched modules** | `boursedirect`, `esalia`, `fortuneo`: `patches/0001-*.patch` applied on top of master |
+| **Patched modules** | `boursedirect`, `esalia`, `fortuneo`: one patch per module in `patches/`, applied on top of master |
 | **`bp` module** | the master one, with what its Selenium login needs: Firefox ESR, geckodriver, `selenium` |
 | **Sure bridge** | `sure-bridge/sure-bridge.py`, run every day by the `sure-bridge` service |
 
@@ -62,6 +62,9 @@ patches from your local clone, which must be on the commit you want to build:
 scripts/make-patches.sh /path/to/woob feat/boursedirect-esalia
 ```
 
+It writes one patch per module (`0001-boursedirect.patch`, `0002-esalia.patch`, ...) and none for a module that no
+longer differs from upstream, so a patch can be dropped on its own once upstream has integrated the fix.
+
 ## Image size
 
 Multi-stage build on `node:24-bookworm-slim`: compilers, `-dev` packages, git and npm caches stay in the builder
@@ -100,7 +103,12 @@ encrypts the bank credentials: without it the backed-up database is unusable.
   strong authentication at every login, and a 403 from the bank with Woob's frozen Firefox 102 User-Agent.
   Firefox runs headless with `shm_size: 1gb`.
 - **Hard-coded paths**: the `boursedirect` and `esalia` modules write to `/var/lib/kresus` (Esalia tokens, JSON
-  positions, device id). That is the data volume; the bridge reads the positions read-only.
+  positions and history, device id; Bourse Direct positions and account history). That is the data volume; the bridge reads the positions read-only.
+- **Bourse Direct history backfill**: the account history page only goes back about two months. On the first sync
+  (no `boursedirect-avis-<account>.json` yet) the module walks the trade confirmations ("avis d'opéré", one page per
+  day, month by month) back to the first one, saves them in that file and adds the operations older than the history
+  page to `boursedirect-history-<account>.json`. Later syncs only use the history page. To redo the backfill, delete
+  both files and sync again.
 - **Esalia**: the module registers the terminal (`REMEMBER_DEVICE = True`) with an identifier stored in
   `/var/lib/kresus/esalia-device-id`, i.e. in the volume. If the OTP code is asked again every day, look in
   `docker compose logs kresus` for the line "new device identifier generated": it means the identifier was

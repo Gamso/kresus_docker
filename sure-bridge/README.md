@@ -50,6 +50,49 @@ State keys were renamed from the French version (`livret` → `savings`, `couran
 Carrying over an old `state.json` resends balances (harmless, they are upserted) and re-checks transactions
 (deduplicated); the PEA and PEE keys are unchanged.
 
+## PEE history
+
+With `PEE_HISTORY=1` (valuation mode), the bridge also fills the past of the PEE curve. The `esalia` module writes
+`/var/lib/kresus/esalia-history.json` during its sync: every operation of the account (parts bought or sold per fund,
+from `GET /transactions` and its `instructions`) and the unit price history of every fund (`historique_valorisations`).
+The bridge then sends, for each date with a known price since the first operation, one valuation equal to
+**parts held × unit price**. The reconstruction was checked against the real positions: it gives exactly the parts held today.
+
+- Sent once; the next syncs only send the missing days (`pee.history_until` in `state.json`). Valuations are upserted,
+  so running it twice is harmless.
+- Funds that disappeared (fund merger) are valued with their own price history until they were sold or merged.
+- The history file is refreshed when the number of operations changes, or once a day.
+- `sure-bridge.py pee-history` prints a preview of the curve (first and last dates, and the last point compared with
+  today's valuation) without contacting Sure or Kresus. `sync --dry-run` prints how many valuations would be sent.
+- Not done in `lines` mode, where the holdings are built from trades.
+
+## PEA: replaying the last two months with their real dates
+
+The Bourse Direct history page only shows about two months, and the bridge normally sends the PEA as differences
+between two exports of the positions, dated the day it notices them. `pea-rebuild` replaces that with the real
+operations: the `boursedirect` module writes the rows of the history page (date, operation, security, quantity,
+price, net amount) to `/var/lib/kresus/boursedirect-history-<account>.json`, merged across syncs so rows that
+left the window are kept.
+
+The replay rebuilds the state at the start of the window backwards from today's positions: quantity = quantity now
+− bought + sold, opening average cost solved so that replaying the buys and sells gives today's PRU, opening cash =
+today's cash − the net cash flows. Then it sends the opening deposit and positions, and every operation with its date:
+buys and sells as trades, transfers and coupons as deposits (a coupon counts as a deposit, as before). Operations
+without cash (listing changes) are ignored. Afterwards `state.json` holds today's positions, so the daily sync goes
+back to sending only differences.
+
+**It writes to Sure and needs an empty PEA account**, otherwise the positions would be counted twice:
+
+1. Run a Bourse Direct sync in Kresus (this writes the history file), then
+   `sure-bridge.py pea-rebuild --dry-run`: it prints the plan (positions at the start of the window, opening deposit,
+   the operations) and tells whether the Sure account is empty. It writes nothing and fixes nothing.
+2. Empty the PEA account in Sure (delete its trades, or recreate the account with the same name and a balance of 0).
+3. `sure-bridge.py pea-rebuild --yes` writes it. Without `--yes` the command refuses; with a non-empty Sure account it
+   refuses too, and it refuses to run twice.
+
+The command stops with an error, writing nothing, if a security of the history is not among today's positions
+(a fully sold line), if an operation with a quantity is unknown, or if a buy is larger than the position.
+
 ## Caveats
 
 - **Securities created offline**: if Yahoo is rate-limited during a first buy, Sure creates the security "offline"
@@ -67,4 +110,3 @@ Carrying over an old `state.json` resends balances (harmless, they are upserted)
 
 - Crypto (Kraken): opening buy at the Koinly cost basis, then buys read from the Kraken API (read-only key).
   Koinly has no public API and Sure has no Koinly connector.
-- Esalia unit price history (`historique_valorisations`) to rebuild past curves.
