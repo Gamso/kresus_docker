@@ -1,0 +1,49 @@
+# docker compose up -d --build
+# Kresus UI: http://localhost:9876
+name: kresus-docker   # fixed project name: volumes are kresus-docker_kresus-data and kresus-docker_sure-bridge-state
+services:
+  kresus:
+    build: .
+    image: kresus-woob:local
+    container_name: kresus
+    restart: unless-stopped
+    ports:
+      - "${KRESUS_PORT:-9876}:9876"
+    environment:
+      TZ: ${TZ:-Europe/Paris}
+      # Experiment: keep cookies between full Esalia logins (see README, "Esalia")
+      ESALIA_KEEP_COOKIES: ${ESALIA_KEEP_COOKIES:-0}
+    volumes:
+      # SQLite database, encryption salt (config.ini), sessions, module exports: back this up
+      - kresus-data:/var/lib/kresus
+    shm_size: "1gb"            # Firefox (Selenium, bp module) crashes with the default 64 MB /dev/shm
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9876/"]
+      interval: 60s
+      timeout: 10s
+      start_period: 90s
+      retries: 3
+
+  sure-bridge:
+    image: kresus-woob:local
+    container_name: sure-bridge
+    restart: unless-stopped
+    depends_on:
+      kresus:
+        condition: service_healthy
+    command: ["sure-bridge-scheduler.sh"]
+    environment:
+      TZ: ${TZ:-Europe/Paris}
+      SURE_SYNC_TIME: ${SURE_SYNC_TIME:-07:30}
+      SURE_RUN_ON_START: ${SURE_RUN_ON_START:-0}
+    volumes:
+      # Configuration editable without rebuilding the image (Sure API key, account names...)
+      - ./config/sure-bridge.env:/etc/sure-bridge.env:ro
+      # Positions exported by the boursedirect and esalia modules (read-only)
+      - kresus-data:/var/lib/kresus:ro
+      # Bridge state: what has already been sent to Sure
+      - sure-bridge-state:/var/lib/sure-bridge
+
+volumes:
+  kresus-data:
+  sure-bridge-state:

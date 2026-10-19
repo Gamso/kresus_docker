@@ -1,0 +1,5 @@
+# Secrets : ne jamais commiter
+config/sure-bridge.env
+.env
+*.sqlite
+*.tar.gz

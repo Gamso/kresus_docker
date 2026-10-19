@@ -1,0 +1,576 @@
+diff --git a/modules/boursedirect/browser.py b/modules/boursedirect/browser.py
+index f08cb1ff3..3ee6f0fc0 100644
+--- a/modules/boursedirect/browser.py
++++ b/modules/boursedirect/browser.py
+@@ -53,6 +53,8 @@
+ 
+ class BoursedirectBrowser(TwoFactorBrowser):
+     BASEURL = "https://www.boursedirect.fr"
++    # The legacy /priv/ pages can take longer than Woob's 10 s default to answer right after a fresh login
++    TIMEOUT = 60.0
+     HAS_CREDENTIALS_ONLY = True
+ 
+     login = URL(r"/hub/auth/login", LoginPage)
+@@ -221,12 +223,55 @@ def handle_totp(self):
+     def handle_otp_sms(self):
+         self.do_twofa_validation(self.otp_sms, self.validate_otp_sms)
+ 
++    def _export_positions(self, account):
++        import json
++        import os
++        import time
++        from decimal import Decimal
++
++        def num(v):
++            return float(v) if isinstance(v, (int, float, Decimal)) else None
++
++        try:
++            out = []
++            for inv in self.iter_investment(account):
++                out.append({
++                    "libelle": str(inv.label) if isinstance(inv.label, str) else None,
++                    "isin": inv.code if isinstance(inv.code, str) else None,
++                    "quantite": num(inv.quantity),
++                    "pru": num(inv.unitprice),
++                    "cours": num(inv.unitvalue),
++                    "valeur": num(inv.valuation),
++                    "plus_value": num(inv.diff),
++                })
++            path = "/var/lib/kresus/boursedirect-positions-%s.json" % account.id
++            with open(path + ".tmp", "w") as f:
++                json.dump({"date": time.strftime("%Y-%m-%d"), "compte": str(account.id),
++                           "libelle": str(account.label), "positions": out}, f, ensure_ascii=False, indent=1)
++            os.replace(path + ".tmp", path)
++        except Exception as e:
++            try:
++                with open("/var/lib/kresus/boursedirect-debug.txt", "a") as f:
++                    f.write("%s export err=%s: %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), type(e).__name__, e))
++            except OSError:
++                pass
++
+     @need_login
+     def iter_accounts(self):
+         self.accounts.go()
++        if self.page is None and "legacy-token-expired" in self.url:
++            # Session restauree mais jeton de l'espace legacy expire : reconnexion
++            self.do_login()
++            self.accounts.go()
++        if self.page is None:
++            from urllib.parse import urlsplit
++            u = urlsplit(self.url)
++            hops = [urlsplit(r.url).path for r in self.response.history]
++            raise AssertionError("Boursedirect: page inconnue %s%s [%s] via=%s" % (u.netloc, u.path, self.response.status_code, hops))
+         for account in self.page.iter_accounts():
+             self.accounts.go(nc=account._select)
+             self.page.fill_account(obj=account)
++            self._export_positions(account)
+             yield account
+ 
+     @need_login
+diff --git a/modules/esalia/browser.py b/modules/esalia/browser.py
+index c5aede107..1e7468ca8 100644
+--- a/modules/esalia/browser.py
++++ b/modules/esalia/browser.py
+@@ -15,6 +15,8 @@
+ # You should have received a copy of the GNU Lesser General Public License
+ # along with this woob module. If not, see <http://www.gnu.org/licenses/>.
+ 
++import os
++
+ from woob.browser import URL
+ from woob.tools.url import get_url_param
+ from woob_modules.erehsbc.browser import ErehsbcBrowser
+@@ -40,12 +42,466 @@ class EsaliaBrowser(ErehsbcBrowser):
+     )
+ 
+     def build_authentication_params(self):
+-        # Keeping redirect_uri in the state for OTP connections
+-        # that will need it in finalize_login
+-        self.redirect_uri = get_url_param(self.url, "goto")
++        import hashlib
++        import secrets
++        from base64 import urlsafe_b64encode
++        from urllib.parse import urlencode
++
++        verifier = secrets.token_urlsafe(48)
++        digest = hashlib.sha256(verifier.encode()).digest()
++        challenge = urlsafe_b64encode(digest).rstrip(b"=").decode()
++        self.code_verifier = verifier
++        self.oauth_state = secrets.token_urlsafe(24)
++        query = urlencode(
++            {
++                "response_type": "code",
++                "client_id": "sg_nfe_web",
++                "scope": "openid nfe",
++                "state": self.oauth_state,
++                "ui_locales": "fr",
++                "redirect_uri": "https://salaries.esalia.com/sso/oauth2/code/iam",
++                "locale": "fr",
++                "nonce": secrets.token_urlsafe(24),
++                "code_challenge": challenge,
++                "code_challenge_method": "S256",
++            }
++        )
++        # Standard ForgeRock path, to be confirmed
++        self.redirect_uri = "https://iam.esalia.com/connect/oauth2/authorize?" + query
+         return {
+             "locale": "fr",
+             "goto": self.redirect_uri,
+             "authIndexType": "service",
+             "authIndexValue": "authn_sg_ws",
+         }
++
++    def init_login(self):
++        from base64 import b64decode, b64encode
++        from random import choices
++        from string import digits
++
++        from Cryptodome.Cipher import PKCS1_v1_5
++        from Cryptodome.PublicKey import RSA
++        from woob.browser.exceptions import ClientError
++        from woob.exceptions import BrowserIncorrectPassword
++
++        hdrs = {"Accept-API-Version": "protocol=1.0,resource=2.1"}
++        params = self.build_authentication_params()
++        self.authentication_page.go(json={}, params=params, headers=hdrs)
++        data = self.page.doc
++        callbacks = data.get("callbacks", [])
++
++        def outs(cb):
++            return {o["name"]: o["value"] for o in cb.get("output", [])}
++
++        def find(kind, **cond):
++            for cb in callbacks:
++                if cb["type"] == kind and all(outs(cb).get(k) == v for k, v in cond.items()):
++                    return cb
++            return None
++
++        name_cb = find("NameCallback")
++        pwd_cb = find("PasswordCallback")
++        key_cb = find("HiddenValueCallback", id="publicKey")
++        meta_cb = find("MetadataCallback")
++        if not (name_cb and pwd_cb and key_cb):
++            raise AssertionError("Esalia: formulaire inattendu: %s" % [c["type"] for c in callbacks])
++
++        public_key = outs(key_cb)["value"]
++        meta = outs(meta_cb).get("data", {}) if meta_cb else {}
++        with_salt = not meta.get("ENCRYPT_WITHOUT_SALT", False)
++
++        secret = ("".join(choices(digits, k=24)) if with_salt else "") + self.password
++        cipher = PKCS1_v1_5.new(RSA.import_key(b64decode(public_key)))
++        name_cb["input"][0]["value"] = self.username
++        pwd_cb["input"][0]["value"] = b64encode(cipher.encrypt(secret.encode())).decode()
++        key_cb["input"][0]["value"] = public_key
++
++        try:
++            self.authentication_page.go(json=data, headers=hdrs)
++        except ClientError as e:
++            if e.response.status_code == 401:
++                raise BrowserIncorrectPassword()
++            raise
++        return self.response.json()
++
++    HDRS = {"Accept-API-Version": "protocol=1.0,resource=2.1"}
++
++    def _summary(self, data):
++        out = []
++        for cb in data.get("callbacks", []):
++            o = {x["name"]: x["value"] for x in cb.get("output", [])}
++            item = {"type": cb["type"], "inputs": [i["name"] for i in cb.get("input", [])]}
++            if isinstance(o.get("id"), str):
++                item["id"] = o["id"]
++            if isinstance(o.get("prompt"), str) and len(o["prompt"]) < 60:
++                item["prompt"] = o["prompt"]
++            if "choices" in o:
++                item["choices"] = o["choices"]
++            for k, v in o.items():
++                if isinstance(v, bool):
++                    item[k] = v
++            for k in ("value", "message", "data"):
++                if isinstance(o.get(k), str):
++                    item[k + "_len"] = len(o[k])
++                    if k == "message":
++                        low = o[k].lower()
++                        item["mentions"] = [w for w in ("sms", "mail", "telephone", "téléphone", "code") if w in low]
++            out.append(item)
++        return out
++
++    def _device_id(self):
++        import secrets
++
++        path = "/var/lib/kresus/esalia-device-id"
++        try:
++            with open(path) as f:
++                value = f.read().strip()
++            if value:
++                return value
++        except OSError:
++            pass
++        value = "-".join(str(secrets.randbelow(2**32)) for _ in range(3))
++        self.logger.warning("new device identifier generated (%s): Esalia will ask for an OTP code", path)
++        try:
++            with open(path, "w") as f:
++                f.write(value)
++        except OSError:
++            pass
++        return value
++
++    def _device_profile(self, want_metadata):
++        import json
++
++        profile = {"identifier": self._device_id()}
++        if want_metadata:
++            profile["metadata"] = {
++                "hardware": {
++                    "deviceMemory": 8,
++                    "hardwareConcurrency": 8,
++                    "maxTouchPoints": 0,
++                    "oscpu": "Linux x86_64",
++                    "display": {"colorDepth": 24, "pixelDepth": 24, "height": 1080, "width": 1920},
++                },
++                "browser": {
++                    "appName": "Netscape",
++                    "appCodeName": "Mozilla",
++                    "appVersion": "5.0 (X11)",
++                    "buildID": "20181001000000",
++                    "product": "Gecko",
++                    "productSub": "20100101",
++                    "vendor": "",
++                    "vendorSub": "",
++                    "plugins": "",
++                },
++                "platform": {
++                    "language": "fr-FR",
++                    "platform": "Linux x86_64",
++                    "userAgent": "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0",
++                    "deviceName": "Linux (Browser)",
++                    "fonts": "Arial;Courier New;Times New Roman;",
++                    "timezone": -120,
++                },
++            }
++        return json.dumps(profile, separators=(",", ":"))
++
++    def _submit_device_collect(self, data):
++        for cb in data.get("callbacks", []):
++            if cb["type"] == "DeviceProfileCallback" and cb.get("input"):
++                o = {x["name"]: x["value"] for x in cb.get("output", [])}
++                if o.get("location"):
++                    raise AssertionError("Esalia: localisation demandee: %s" % self._summary(data))
++                cb["input"][0]["value"] = self._device_profile(bool(o.get("metadata", True)))
++                self.authentication_page.go(json=data, headers=self.HDRS)
++                return self.response.json()
++        raise AssertionError("Esalia: DeviceCollect inattendu: %s" % self._summary(data))
++
++    def _submit_as_is(self, data):
++        self.authentication_page.go(json=data, headers=self.HDRS)
++        return self.response.json()
++
++    REMEMBER_DEVICE = True  # True : enregistrer ce terminal (plus de code a chaque synchro)
++
++    def _set_choice(self, data, prompt, index):
++        for cb in data.get("callbacks", []):
++            if cb["type"] == "ChoiceCallback" and cb.get("input"):
++                o = {x["name"]: x["value"] for x in cb.get("output", [])}
++                if o.get("prompt") == prompt:
++                    cb["input"][0]["value"] = index
++
++    def _advance(self, data):
++        from woob.exceptions import NeedInteractiveFor2FA, SentOTPQuestion
++
++        for _ in range(6):
++            if "tokenId" in data:
++                return data
++            stage = data.get("stage")
++            if stage == "DeviceCollect":
++                data = self._submit_device_collect(data)
++            elif stage == "OTPInfo":
++                if not self.is_interactive:
++                    raise NeedInteractiveFor2FA()
++                data = self._submit_as_is(data)
++            elif stage == "OTP":
++                self.otp_json = data
++                data["_kv"] = {"v": self.code_verifier, "s": self.oauth_state}
++                raise SentOTPQuestion("otp", message="Entrez le code de validation recu par SMS ou e-mail")
++            else:
++                raise AssertionError("Esalia: etape non geree: stage=%s structure=%s" % (stage, self._summary(data)))
++        raise AssertionError("Esalia: trop d'etapes, stage=%s" % data.get("stage"))
++
++    def handle_otp(self):
++        from woob.browser.exceptions import ClientError
++        from woob.exceptions import BrowserIncorrectPassword
++
++        data = self.otp_json
++        kv = data.pop("_kv", {})
++        self.code_verifier = kv.get("v")
++        self.oauth_state = kv.get("s")
++        code = self.config["otp"].get()
++        for cb in data["callbacks"]:
++            if cb["type"] == "PasswordCallback" and cb.get("input"):
++                cb["input"][0]["value"] = code
++        self._set_choice(data, "rememberTerminal", 1 if self.REMEMBER_DEVICE else 0)
++        self._set_choice(data, "iam_action", 0)
++        try:
++            self.authentication_page.go(json=data, headers=self.HDRS)
++        except ClientError as e:
++            if e.response.status_code == 401:
++                raise AssertionError(
++                    "Esalia: OTP 401 len=%d digits=%s body=%s"
++                    % (len(code or ""), str(code or "").isdigit(), e.response.text[:300])
++                )
++            raise
++        new = self.response.json()
++        if new.get("stage") == "OTP":
++            err = ""
++            for cb in new.get("callbacks", []):
++                o = {x["name"]: x["value"] for x in cb.get("output", [])}
++                if o.get("id") == "error-iam":
++                    err = str(o.get("value", ""))
++            raise AssertionError(
++                "Esalia: OTP refuse len=%d digits=%s error-iam=%s"
++                % (len(code or ""), str(code or "").isdigit(), err[:200])
++            )
++        self.otp_json = None
++        self._advance(new)
++        self._finish_oauth()
++
++    CALLBACK = "https://salaries.esalia.com/sso/oauth2/code/iam"
++    API = "https://salaries.esalia.com"
++    CLIENT_ID = "sg_nfe_web"
++    esalia_tokens = None
++    _token_fresh = False
++
++    # --- Jetons OAuth2 ---------------------------------------------------
++    def dump_state(self):
++        state = super().dump_state()
++        state["esalia_tokens"] = self.esalia_tokens
++        return state
++
++    def load_state(self, state):
++        self.esalia_tokens = state.get("esalia_tokens")
++        super().load_state(state)
++
++    def _token_request(self, data):
++        payload = dict(data)
++        payload["client_id"] = self.CLIENT_ID
++        tok = self.open(self.API + "/api/auth/token", data=payload).json()
++        if not tok.get("access_token"):
++            raise AssertionError("Esalia: reponse token sans access_token: %s" % sorted(tok.keys()))
++        self.esalia_tokens = {"access": tok["access_token"], "refresh": tok.get("refresh_token")}
++        self._token_fresh = True
++        self._save_tokens_file()
++
++    def _finish_oauth(self):
++        from urllib.parse import parse_qs, urljoin, urlsplit
++
++        r = self.open(self.redirect_uri, allow_redirects=False)
++        loc, hops = r.headers.get("Location", ""), 0
++        while loc and not loc.startswith(self.CALLBACK) and hops < 5:
++            r = self.open(urljoin(r.url, loc), allow_redirects=False)
++            loc, hops = r.headers.get("Location", ""), hops + 1
++        q = parse_qs(urlsplit(loc).query)
++        code = (q.get("code") or [None])[0]
++        if not code or (q.get("state") or [None])[0] != self.oauth_state:
++            raise AssertionError("Esalia: retour OAuth2 inattendu (status=%s code=%s)" % (r.status_code, bool(code)))
++        self._token_request({
++            "grant_type": "authorization_code",
++            "code_verifier": self.code_verifier,
++            "redirect_uri": self.CALLBACK,
++            "code": code,
++        })
++
++    TOKENS_FILE = "/var/lib/kresus/esalia-tokens.json"
++
++    def _load_tokens_file(self):
++        import json
++
++        try:
++            with open(self.TOKENS_FILE) as f:
++                return json.load(f)
++        except (OSError, ValueError):
++            return None
++
++    def _save_tokens_file(self):
++        import json
++        import os
++
++        try:
++            fd = os.open(self.TOKENS_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
++            with os.fdopen(fd, "w") as f:
++                json.dump(self.esalia_tokens, f)
++        except OSError:
++            pass
++
++    def _ensure_token(self):
++        from woob.browser.exceptions import ClientError
++
++        if self.esalia_tokens and self.esalia_tokens.get("access") and self._token_fresh:
++            return
++        from_file = self._load_tokens_file()
++        tokens = from_file or self.esalia_tokens or {}
++        source = "fichier" if from_file else ("session" if self.esalia_tokens else "aucune")
++        if tokens.get("refresh"):
++            try:
++                self._token_request({"grant_type": "refresh_token", "refresh_token": tokens["refresh"]})
++                self.logger.debug("token refreshed (source=%s)", source)
++                return
++            except ClientError as e:
++                er = getattr(e, "response", None)
++                self.logger.debug("token refresh refused: status=%s (source=%s)", getattr(er, "status_code", None), source)
++                self.esalia_tokens = None
++        else:
++            self.logger.debug("no refresh token (source=%s)", source)
++        self.do_login()
++
++    def _api_get(self, href):
++        self._ensure_token()
++        if href.startswith("http"):
++            url = href
++        elif href.startswith("/api/"):
++            url = self.API + href
++        elif href.startswith("/"):
++            url = self.API + "/api/epargnant/v1" + href
++        else:
++            url = self.API + "/api/epargnant/v1/" + href
++        return self.open(url, headers={"Authorization": "Bearer " + self.esalia_tokens["access"]}).json()
++
++    # --- Donnees -----------------------------------------------------------
++    def iter_accounts(self):
++        import re
++        from decimal import Decimal
++
++        from woob.capabilities.bank import Account
++
++        plans = self._api_get("/api/epargnant/v1/plans-epargne")
++        accounts = []
++        positions_out, support_cache = [], {}
++        for plan in plans:
++            label, kind, disp_per = None, "", False
++            href = ((plan.get("_links") or {}).get("dispositif_epargne") or {}).get("href")
++            if href:
++                try:
++                    disp = self._api_get(href)
++                    if isinstance(disp, dict):
++                        disp_per = bool(disp.get("composant_per"))
++                        for k in ("titre", "libelle", "libelle_long", "libelle_court", "nom", "intitule", "label"):
++                            if isinstance(disp.get(k), str) and disp[k].strip():
++                                label = disp[k].strip()
++                                break
++                        for k in ("type", "type_dispositif", "code_type", "famille", "categorie", "code"):
++                            if isinstance(disp.get(k), str):
++                                kind = disp[k]
++                                break
++                except Exception as e:
++                    self.logger.warning("dispositif lookup failed: %s", type(e).__name__)
++
++            amount = plan.get("montant_total_brut") or {}
++            acc = Account()
++            acc.id = str(plan["id"])
++            acc.number = acc.id
++            acc.label = label or "Esalia %s" % plan.get("id_dispositif_epargne", acc.id)
++            acc.balance = Decimal(str(amount.get("montant", 0)))
++            acc.currency = amount.get("devise") or "EUR"
++            words = set(re.findall(r"[A-Z]+", ("%s %s %s" % (kind, acc.label, plan.get("id_dispositif_epargne", ""))).upper()))
++            retraite = bool(words & {"PER", "PERCO", "PERCOL", "PERCOI", "PERECO", "PERECOL", "PERO", "RETRAITE"})
++            acc.type = getattr(Account, "TYPE_PER", Account.TYPE_PERCO) if (retraite or disp_per) else Account.TYPE_PEE
++            gain = plan.get("plus_value") or {}
++            if "montant" in gain:
++                acc.valuation_diff = Decimal(str(gain["montant"]))
++            pos_href = ((plan.get("_links") or {}).get("positions") or {}).get("href")
++            if pos_href:
++                try:
++                    for pos in self._api_get(pos_href) or []:
++                        parts = pos.get("nb_parts") or 0
++                        val = (pos.get("montant_total_brut") or {}).get("montant") or 0
++                        if not parts and not val:
++                            continue
++                        pv = (pos.get("plus_value") or {}).get("montant") or 0
++                        sup_id = pos.get("id_support_investissement")
++                        sup = support_cache.get(sup_id)
++                        if sup is None:
++                            sup = {}
++                            s_href = ((pos.get("_links") or {}).get("support_investissement") or {}).get("href")
++                            if s_href:
++                                try:
++                                    sup = self._api_get(s_href) or {}
++                                except Exception as e:
++                                    self.logger.warning("support lookup failed: %s", type(e).__name__)
++                            support_cache[sup_id] = sup
++                        name = next((sup[k] for k in ("libelle", "titre", "nom", "libelle_long", "label")
++                                     if isinstance(sup.get(k), str) and sup[k].strip()), sup_id)
++                        isin = next((sup[k] for k in ("code_isin", "isin", "code")
++                                     if isinstance(sup.get(k), str) and sup[k].strip()), None)
++                        cost = val - pv
++                        positions_out.append({
++                            "plan_id": str(plan["id"]),
++                            "plan": acc.label,
++                            "position_id": str(pos.get("id")),
++                            "support_id": sup_id,
++                            "fonds": name,
++                            "isin": isin,
++                            "parts": parts,
++                            "valeur": val,
++                            "plus_value": pv,
++                            "cout": round(cost, 2),
++                            "pru": round(cost / parts, 6) if parts else None,
++                            "vl": round(val / parts, 6) if parts else None,
++                            "devise": (pos.get("montant_total_brut") or {}).get("devise") or "EUR",
++                        })
++                except Exception as e:
++                    self.logger.warning("positions lookup failed: %s", type(e).__name__)
++            accounts.append(acc)
++
++        try:
++            import json
++            import os
++            import time
++
++            tmp = "/var/lib/kresus/esalia-positions.json.tmp"
++            with open(tmp, "w") as f:
++                json.dump({"date": time.strftime("%Y-%m-%d"), "positions": positions_out}, f, ensure_ascii=False, indent=1)
++            os.replace(tmp, "/var/lib/kresus/esalia-positions.json")
++        except OSError as e:
++            self.logger.warning("export positions failed: %s", e)
++        return accounts
++
++    def iter_history(self, *args, **kwargs):
++        return []
++
++    def iter_investment(self, *args, **kwargs):
++        return []
++
++    def iter_pocket(self, *args, **kwargs):
++        return []
++
++    def do_login(self):
++        if self.config["otp"].get() and self.otp_json:
++            return self.handle_otp()
++        # Experiment: ESALIA_KEEP_COOKIES=1 keeps the cookies between full logins, in case Esalia
++        # recognizes a trusted terminal through a persistent cookie and not only the device id.
++        if os.environ.get("ESALIA_KEEP_COOKIES") != "1":
++            self.session.cookies.clear()
++        self._advance(self.init_login())
++        self._finish_oauth()
+diff --git a/modules/fortuneo/browser.py b/modules/fortuneo/browser.py
+index 79441a496..077ec9724 100644
+--- a/modules/fortuneo/browser.py
++++ b/modules/fortuneo/browser.py
+@@ -550,13 +550,17 @@ def iter_history(self, account):
+         self.location(account._history_link)
+ 
+         if self.account_history.is_here():
+-            # Checking account: use REST API
++            # Checking and savings accounts: use REST API
+             account_api_id = self.page.get_account_api_id()
+             if account_api_id:
+                 self.portal_sso.go(headers={"apikey": self.client_id})
++                params = {"metadata": "true"}
++                # The CAV (current account) filter drops savings accounts transactions (livret)
++                if account.type == Account.TYPE_CHECKING:
++                    params["transactionType"] = "CAV,PENDING"
+                 self.api_transactions.go(
+                     id=account_api_id,
+-                    params={"transactionType": "CAV,PENDING", "metadata": "true"},
++                    params=params,
+                     headers={"apikey": self.client_id},
+                 )
+                 return sorted_transactions(list(self.page.iter_history()))
