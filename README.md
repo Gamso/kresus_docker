@@ -65,8 +65,9 @@ scripts/make-patches.sh /path/to/woob feat/boursedirect-esalia
 ## Image size
 
 Multi-stage build on `node:24-bookworm-slim`: compilers, `-dev` packages, git and npm caches stay in the builder
-stage. About 1.4 GB uncompressed (a single-stage build on the full `node` image was 3.1 GB). Firefox ESR, needed by
-the `bp` module's Selenium login, is the biggest part (about 0.5 GB with its libraries).
+stage, and npm/yarn, the icon theme and the docs are removed from the final image. About 1.3 GB uncompressed (a
+single-stage build on the full `node` image was 3.1 GB). Firefox ESR, which the `bp` module's Selenium login needs,
+is about 0.5 GB of it with its libraries, so there is no browser-less variant.
 
 ## Backup
 

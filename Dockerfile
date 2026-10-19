@@ -54,6 +54,7 @@ RUN python3 -m venv /opt/venv \
       simplejson BeautifulSoup4 PyExecJS typing-extensions pdfminer.six Pillow pycountry \
       pycryptodomex pyjwt xlrd chompjs schwifty deprecated html2text \
  && /opt/venv/bin/python -c "import woob, selenium; print('woob', woob.__version__, 'selenium', selenium.__version__)" \
+ && /opt/venv/bin/pip uninstall -y pip wheel \
  && find /opt/venv -name __pycache__ -type d -prune -exec rm -rf {} +
 
 # Kresus: latest npm release. better-sqlite3 is a development dependency of the package:
@@ -77,9 +78,14 @@ ENV DEBIAN_FRONTEND=noninteractive LC_ALL=C.UTF-8 LANG=C.UTF-8
 
 # Runtime only: Python (the venv is copied from the builder, same Debian release), Firefox for the bp
 # module (Selenium), curl for the healthcheck, tzdata for TZ. No compilers, no git, no -dev packages.
+# npm, yarn and corepack come with the node image but Kresus does not need them at runtime; the icon theme,
+# docs and man pages pulled in by Firefox's GTK dependencies are useless in a headless container.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       python3 firefox-esr tzdata curl ca-certificates \
- && rm -rf /var/lib/apt/lists/* /var/cache/apt/*
+ && rm -rf /var/lib/apt/lists/* /var/cache/apt/* \
+ && rm -rf /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/corepack /opt/yarn-* \
+      /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack /usr/local/bin/yarn /usr/local/bin/yarnpkg \
+      /usr/local/include /usr/share/icons /usr/share/doc /usr/share/man /usr/share/info /usr/share/lintian
 
 COPY --from=builder /usr/local/bin/geckodriver /usr/local/bin/geckodriver
 COPY --from=builder /opt/venv /opt/venv
