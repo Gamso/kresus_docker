@@ -66,6 +66,33 @@ The bridge then sends, for each date with a known price since the first operatio
   today's valuation) without contacting Sure or Kresus. `sync --dry-run` prints how many valuations would be sent.
 - Not done in `lines` mode, where the holdings are built from trades.
 
+## PEA: replaying the last two months with their real dates
+
+The Bourse Direct history page only shows about two months, and the bridge normally sends the PEA as differences
+between two exports of the positions, dated the day it notices them. `pea-rebuild` replaces that with the real
+operations: the `boursedirect` module writes the rows of the history page (date, operation, security, quantity,
+price, net amount) to `/var/lib/kresus/boursedirect-history-<account>.json`, merged across syncs so rows that
+left the window are kept.
+
+The replay rebuilds the state at the start of the window backwards from today's positions: quantity = quantity now
+− bought + sold, opening average cost solved so that replaying the buys and sells gives today's PRU, opening cash =
+today's cash − the net cash flows. Then it sends the opening deposit and positions, and every operation with its date:
+buys and sells as trades, transfers and coupons as deposits (a coupon counts as a deposit, as before). Operations
+without cash (listing changes) are ignored. Afterwards `state.json` holds today's positions, so the daily sync goes
+back to sending only differences.
+
+**It writes to Sure and needs an empty PEA account**, otherwise the positions would be counted twice:
+
+1. Run a Bourse Direct sync in Kresus (this writes the history file), then
+   `sure-bridge.py pea-rebuild --dry-run`: it prints the plan (positions at the start of the window, opening deposit,
+   the operations) and tells whether the Sure account is empty. It writes nothing and fixes nothing.
+2. Empty the PEA account in Sure (delete its trades, or recreate the account with the same name and a balance of 0).
+3. `sure-bridge.py pea-rebuild --yes` writes it. Without `--yes` the command refuses; with a non-empty Sure account it
+   refuses too, and it refuses to run twice.
+
+The command stops with an error, writing nothing, if a security of the history is not among today's positions
+(a fully sold line), if an operation with a quantity is unknown, or if a buy is larger than the position.
+
 ## Caveats
 
 - **Securities created offline**: if Yahoo is rate-limited during a first buy, Sure creates the security "offline"

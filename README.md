@@ -103,7 +103,7 @@ encrypts the bank credentials: without it the backed-up database is unusable.
   strong authentication at every login, and a 403 from the bank with Woob's frozen Firefox 102 User-Agent.
   Firefox runs headless with `shm_size: 1gb`.
 - **Hard-coded paths**: the `boursedirect` and `esalia` modules write to `/var/lib/kresus` (Esalia tokens, JSON
-  positions and history, device id). That is the data volume; the bridge reads the positions read-only.
+  positions and history, device id; Bourse Direct positions and account history). That is the data volume; the bridge reads the positions read-only.
 - **Esalia**: the module registers the terminal (`REMEMBER_DEVICE = True`) with an identifier stored in
   `/var/lib/kresus/esalia-device-id`, i.e. in the volume. If the OTP code is asked again every day, look in
   `docker compose logs kresus` for the line "new device identifier generated": it means the identifier was

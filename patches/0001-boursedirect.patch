@@ -1,5 +1,5 @@
 diff --git a/modules/boursedirect/browser.py b/modules/boursedirect/browser.py
-index f08cb1ff3..3ee6f0fc0 100644
+index f08cb1ff3..fdf276d1d 100644
 --- a/modules/boursedirect/browser.py
 +++ b/modules/boursedirect/browser.py
 @@ -53,6 +53,8 @@
@@ -11,7 +11,7 @@ index f08cb1ff3..3ee6f0fc0 100644
      HAS_CREDENTIALS_ONLY = True
  
      login = URL(r"/hub/auth/login", LoginPage)
-@@ -221,12 +223,55 @@ def handle_totp(self):
+@@ -221,12 +223,117 @@ def handle_totp(self):
      def handle_otp_sms(self):
          self.do_twofa_validation(self.otp_sms, self.validate_otp_sms)
  
@@ -48,6 +48,67 @@ index f08cb1ff3..3ee6f0fc0 100644
 +            except OSError:
 +                pass
 +
++    def _export_history(self, account):
++        """Writes the rows of the account history page to boursedirect-history-<account>.json.
++
++        The page only shows about two months, so each export is merged with the previous file: rows that scrolled
++        out of the window are kept. Used by the bridge to replay the operations with their real dates.
++        """
++        import json
++        import os
++        from collections import Counter
++        from decimal import Decimal
++
++        if account.type not in (account.TYPE_PEA, account.TYPE_MARKET):
++            return
++
++        def num(value):
++            return float(value) if isinstance(value, (int, float, Decimal)) else None
++
++        def key(row):
++            return tuple(row[k] for k in ("date", "operation_date", "operation", "security", "quantity", "price", "amount"))
++
++        try:
++            self.history.go(nc=account._select)
++            rows = []
++            for tr in self.page.iter_history():
++                investment = tr.investments[0] if isinstance(tr.investments, list) and tr.investments else None
++                rows.append(
++                    {
++                        "date": tr.date.isoformat() if tr.date else None,  # allocation date
++                        "operation_date": tr.rdate.isoformat() if tr.rdate else None,
++                        "operation": tr._operation,
++                        "security": tr._security,
++                        "quantity": num(investment.quantity) if investment else None,
++                        "price": num(investment.unitvalue) if investment else None,
++                        "amount": num(tr.amount),
++                    }
++                )
++
++            path = "/var/lib/kresus/boursedirect-history-%s.json" % account.id
++            try:
++                with open(path) as f:
++                    previous = json.load(f).get("rows", [])
++            except (OSError, ValueError):
++                previous = []
++
++            # Same row seen in both exports: keep it once. Identical rows on the same day count separately.
++            seen, merged = Counter(key(r) for r in rows), list(rows)
++            old_count = Counter()
++            for row in previous:
++                k = key(row)
++                old_count[k] += 1
++                if old_count[k] > seen[k]:
++                    merged.append(row)
++                    seen[k] += 1
++            merged.sort(key=lambda r: (r["date"] or "", r["operation_date"] or ""))
++
++            with open(path + ".tmp", "w") as f:
++                json.dump({"account": str(account.id), "rows": merged}, f, ensure_ascii=False, indent=1)
++            os.replace(path + ".tmp", path)
++        except Exception as e:  # the history is a bonus: never break the account list for it
++            self.logger.warning("export history failed: %s: %s", type(e).__name__, e)
++
      @need_login
      def iter_accounts(self):
          self.accounts.go()
@@ -64,6 +125,20 @@ index f08cb1ff3..3ee6f0fc0 100644
              self.accounts.go(nc=account._select)
              self.page.fill_account(obj=account)
 +            self._export_positions(account)
++            self._export_history(account)
              yield account
  
      @need_login
+diff --git a/modules/boursedirect/pages.py b/modules/boursedirect/pages.py
+index ebf6403da..5f5de5d7d 100644
+--- a/modules/boursedirect/pages.py
++++ b/modules/boursedirect/pages.py
+@@ -402,6 +402,8 @@ class item(ItemElement):
+             obj_rdate = Date(CleanText(TableCell("rdate")), dayfirst=True)  # Date opération
+             obj_label = Format("%s - %s", CleanText(TableCell("investment_label")), CleanText(TableCell("label")))
+             obj_amount = CleanDecimal.French(TableCell("amount"))
++            obj__operation = CleanText(TableCell("label"))
++            obj__security = CleanText(TableCell("investment_label"))
+ 
+             def obj_investments(self):
+                 if CleanDecimal.French(TableCell("unitvalue"), default=None) is None:
