@@ -4,8 +4,8 @@ An image that bundles:
 
 | Component | Source |
 |---|---|
-| **Kresus** | latest npm release (`kresus@latest`, build-arg `KRESUS_VERSION`) |
-| **Woob** | `master` of https://gitlab.com/woob/woob (build-arg `WOOB_REF`, branch or commit) |
+| **Kresus** | npm release pinned in the Dockerfile (`0.26.0`, build-arg `KRESUS_VERSION`) |
+| **Woob** | https://gitlab.com/woob/woob at the master commit the patches were made against (`3bc0f159c`, build-arg `WOOB_REF`: branch, tag or full SHA) |
 | **Patched modules** | `boursedirect`, `esalia`, `fortuneo`: `patches/0001-*.patch` applied on top of master |
 | **`bp` module** | the master one, with what its Selenium login needs: Firefox ESR, geckodriver, `selenium` |
 | **Sure bridge** | `sure-bridge/sure-bridge.py`, run every day by the `sure-bridge` service |
@@ -46,17 +46,27 @@ The Sure accounts must exist before the first send. See `sure-bridge/README.md`.
 
 ## Updating
 
+The `Dockerfile` pins the Kresus version, the Woob commit and the Selenium and geckodriver versions, so the patches
+keep applying. The base image (`node:24-bookworm-slim`) is deliberately not pinned: a rebuild picks up its latest
+security updates. To upgrade:
+
 ```bash
-docker compose build --pull --no-cache && docker compose up -d     # latest Kresus + latest Woob master
-docker compose build --build-arg WOOB_REF=3bc0f159c65f             # pin Woob to a commit
+docker compose build --build-arg KRESUS_VERSION=latest --build-arg WOOB_REF=master   # try the newest of both
 ```
 
-The patches are applied with `git apply`: if Woob's master changed the same lines, **the build fails**
-(it never produces a half-patched image). Regenerate the patches from your local clone:
+then, if it works, put the new values in the `Dockerfile` and commit. The patches are applied with `git apply`:
+if Woob changed the same lines, **the build fails** (it never produces a half-patched image). Regenerate the
+patches from your local clone, which must be on the commit you want to build:
 
 ```bash
 scripts/make-patches.sh /path/to/woob feat/boursedirect-esalia
 ```
+
+## Image size
+
+Multi-stage build on `node:24-bookworm-slim`: compilers, `-dev` packages, git and npm caches stay in the builder
+stage. About 1.4 GB uncompressed (a single-stage build on the full `node` image was 3.1 GB). Firefox ESR, needed by
+the `bp` module's Selenium login, is the biggest part (about 0.5 GB with its libraries).
 
 ## Backup
 
