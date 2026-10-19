@@ -104,6 +104,11 @@ encrypts the bank credentials: without it the backed-up database is unusable.
   Firefox runs headless with `shm_size: 1gb`.
 - **Hard-coded paths**: the `boursedirect` and `esalia` modules write to `/var/lib/kresus` (Esalia tokens, JSON
   positions and history, device id; Bourse Direct positions and account history). That is the data volume; the bridge reads the positions read-only.
+- **Bourse Direct history backfill**: the account history page only goes back about two months. On the first sync
+  (no `boursedirect-avis-<account>.json` yet) the module walks the trade confirmations ("avis d'opéré", one page per
+  day, month by month) back to the first one, saves them in that file and adds the operations older than the history
+  page to `boursedirect-history-<account>.json`. Later syncs only use the history page. To redo the backfill, delete
+  both files and sync again.
 - **Esalia**: the module registers the terminal (`REMEMBER_DEVICE = True`) with an identifier stored in
   `/var/lib/kresus/esalia-device-id`, i.e. in the volume. If the OTP code is asked again every day, look in
   `docker compose logs kresus` for the line "new device identifier generated": it means the identifier was

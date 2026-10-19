@@ -174,7 +174,7 @@ index 000000000..de4dc830b
 +    _assign_amounts(operations, amounts)
 +    return operations
 diff --git a/modules/boursedirect/browser.py b/modules/boursedirect/browser.py
-index f08cb1ff3..fdf276d1d 100644
+index f08cb1ff3..eaa6364e3 100644
 --- a/modules/boursedirect/browser.py
 +++ b/modules/boursedirect/browser.py
 @@ -53,6 +53,8 @@
@@ -186,7 +186,7 @@ index f08cb1ff3..fdf276d1d 100644
      HAS_CREDENTIALS_ONLY = True
  
      login = URL(r"/hub/auth/login", LoginPage)
-@@ -221,12 +223,117 @@ def handle_totp(self):
+@@ -221,12 +223,195 @@ def handle_totp(self):
      def handle_otp_sms(self):
          self.do_twofa_validation(self.otp_sms, self.validate_otp_sms)
  
@@ -284,6 +284,83 @@ index f08cb1ff3..fdf276d1d 100644
 +        except Exception as e:  # the history is a bonus: never break the account list for it
 +            self.logger.warning("export history failed: %s: %s", type(e).__name__, e)
 +
++    def _export_avis(self, account):
++        """One-off backfill of the history from the trade confirmations (avis d'opéré).
++
++        The history page only shows about two months, the confirmations go back much further. They are listed as a
++        calendar, one month per page (&year=&month=), one page per day with operations. On the first sync (no
++        boursedirect-avis-<account>.json yet) the walk goes back until 6 months in a row hold no confirmation, the
++        raw result is saved, and the operations older than the history page are added to the history file, which
++        _export_history keeps merging afterwards. Later syncs only use the history page. BOURSEDIRECT_AVIS=1 forces
++        a new walk.
++        """
++        import json
++        import os
++        from datetime import date
++
++        from .avis import avis_links, parse_avis
++
++        if account.type not in (account.TYPE_PEA, account.TYPE_MARKET):
++            return
++        path = "/var/lib/kresus/boursedirect-avis-%s.json" % account.id
++        history_path = "/var/lib/kresus/boursedirect-history-%s.json" % account.id
++        if os.path.exists(path) and os.environ.get("BOURSEDIRECT_AVIS") != "1":
++            return
++
++        try:
++            with open(history_path) as f:
++                history = json.load(f)
++        except (OSError, ValueError):
++            return  # no history export yet: try again on the next sync rather than mark the backfill as done
++
++        try:
++            today = date.today()
++            year, month, empty = today.year, today.month, 0
++            rows = []
++            while empty < 6 and year >= 2000:
++                key = "%d-%02d" % (year, month)
++                page = self.open("/priv/new/avis-operes.php?nc=%s&year=%d&month=%02d" % (account._select, year, month))
++                month_rows = []
++                for query in avis_links(page.text, year, month):
++                    month_rows.extend(parse_avis(self.open("/priv/new/releveOpe.php?" + query).text))
++                for row in month_rows:
++                    row["month"] = key
++                rows.extend(month_rows)
++                empty = 0 if month_rows else empty + 1
++                year, month = (year, month - 1) if month > 1 else (year - 1, 12)
++            rows.sort(key=lambda r: (r["date"], r["operation"], r["security"] or ""))
++
++            with open(path + ".tmp", "w") as f:
++                json.dump({"account": str(account.id), "rows": rows}, f, ensure_ascii=False, indent=1)
++            os.replace(path + ".tmp", path)
++
++            # Same row schema as the history page; only what the page can no longer show
++            old_rows = history.get("rows", [])
++            first = min((r["operation_date"] or r["date"] for r in old_rows if r.get("date") or r.get("operation_date")),
++                        default="9999-12-31")
++            added = [
++                {
++                    "date": r["date"],
++                    "operation_date": r["date"],
++                    "operation": r["operation"],
++                    "security": r["security"],
++                    "quantity": r["quantity"],
++                    "price": r["price"],
++                    "amount": r["amount"],
++                }
++                for r in rows
++                if r["date"] < first
++            ]
++            merged = added + old_rows
++            merged.sort(key=lambda r: (r["date"] or "", r["operation_date"] or ""))
++            history["rows"] = merged
++            with open(history_path + ".tmp", "w") as f:
++                json.dump(history, f, ensure_ascii=False, indent=1)
++            os.replace(history_path + ".tmp", history_path)
++            self.logger.info("avis backfill: %d operation(s) found, %d added before %s", len(rows), len(added), first)
++        except Exception as e:  # a bonus: never break the account list for it
++            self.logger.warning("export avis failed: %s: %s", type(e).__name__, e)
++
      @need_login
      def iter_accounts(self):
          self.accounts.go()
@@ -301,6 +378,7 @@ index f08cb1ff3..fdf276d1d 100644
              self.page.fill_account(obj=account)
 +            self._export_positions(account)
 +            self._export_history(account)
++            self._export_avis(account)
              yield account
  
      @need_login
