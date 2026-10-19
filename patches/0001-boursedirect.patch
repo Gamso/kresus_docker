@@ -1,3 +1,178 @@
+diff --git a/modules/boursedirect/avis.py b/modules/boursedirect/avis.py
+new file mode 100644
+index 000000000..de4dc830b
+--- /dev/null
++++ b/modules/boursedirect/avis.py
+@@ -0,0 +1,169 @@
++# Copyright(C) 2026
++#
++# This file is part of a Woob module.
++#
++# This Woob module is free software: you can redistribute it and/or modify
++# it under the terms of the GNU Lesser General Public License as published by
++# the Free Software Foundation, either version 3 of the License, or
++# (at your option) any later version.
++#
++# This Woob module is distributed in the hope that it will be useful,
++# but WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++# GNU Lesser General Public License for more details.
++#
++# You should have received a copy of the GNU Lesser General Public License
++# along with this Woob module. If not, see <http://www.gnu.org/licenses/>.
++
++"""Parser of the "Avis d'Opération" pages (releveOpe.php), one page per day with operations."""
++
++import re
++from datetime import datetime
++from urllib.parse import parse_qs
++
++import lxml.html
++
++LINK_RE = re.compile(r"releveOpe\.php\?([^'\"]+)")
++DATE_RE = re.compile(r"^\d{2}/\d{2}/\d{4}$")
++ISIN_RE = re.compile(r"^[A-Z]{2}[A-Z0-9]{9}\d$")
++AMOUNT_RE = re.compile(r"^[+-]?\d[\d\s.]*(?:,\d+)?$")
++KEY_VALUE_RE = re.compile(r"^([^:]+?)\s*:\s*([+-]?\d[\d\s.]*(?:,\d+)?)$")
++END_RE = re.compile(r"^Sous réserve de bonne fin", re.I)
++
++
++def avis_links(html, year=None, month=None):
++    """Query strings of the confirmations listed by the calendar page, one per day, in page order.
++
++    The page always lists the latest confirmations whatever month is asked: when year and month are given, only
++    the links of that month are kept.
++    """
++    seen, out = set(), []
++    for query in LINK_RE.findall(html):
++        query = query.replace("&amp;", "&")
++        if query in seen:
++            continue
++        params = parse_qs(query)
++        if year is not None and (params.get("year") != [str(year)] or params.get("month") not in ([str(month)], ["%02d" % month])):
++            continue
++        seen.add(query)
++        out.append(query)
++    return out
++
++
++def _number(text):
++    return float(text.replace(" ", "").replace("\xa0", "").replace(".", "").replace(",", "."))
++
++
++def _is_label(text):
++    """Operation labels are upper case (ACHAT COMPTANT, COUPONS...); "Heure Execution: ..." only adds details."""
++    return text == text.upper() and bool(re.search(r"[A-Z]", text)) and not KEY_VALUE_RE.match(text) and not AMOUNT_RE.match(text)
++
++
++def _cells(tr):
++    """(text, column index among all the cells of the row), the empty cells being counted but not returned."""
++    out = []
++    for idx, td in enumerate(tr.xpath("./td|./th")):
++        text = " ".join(td.text_content().split())
++        if text:
++            out.append((text, idx))
++    return out
++
++
++NO_CASH_RE = re.compile(r"^(ATTRIBUTION|CHANGEMENT)", re.I)
++
++
++def _sign(operation):
++    """Cash direction from the label: the page nests its tables, so the debit/credit column is not readable."""
++    if re.match(r"^(ACHAT|FRAIS|DROITS|TAXE|TTF|RETRAIT|DESINVESTISSEMENT|REMBOURSEMENT ESPECES)", operation, re.I):
++        return -1
++    return 1
++
++
++def _operation(date, lines):
++    """One operation from the rows of its block. lines: list of lists of (text, column)."""
++    texts = [t for t, _ in lines[0]]
++    row = {
++        "date": date,
++        "operation": texts[0],
++        "isin": None,
++        "security": None,
++        "quantity": None,
++        "price": None,
++        "gross": None,
++        "commission": None,
++        "amount": None,
++    }
++    for text in texts[1:]:
++        if ISIN_RE.match(text):
++            row["isin"] = text
++        elif row["security"] is None:
++            row["security"] = text
++    named = {"QUANTITE": "quantity", "PX UN.BRUT": "price", "COURS": "price", "BRUT": "gross", "COMMISSION": "commission"}
++    for cells in lines[1:]:
++        for text, _ in cells:
++            m = KEY_VALUE_RE.match(text)
++            if m:
++                key = m.group(1).strip().upper()
++                if key in named:
++                    row[named[key]] = _number(m.group(2))
++    if row["price"] is None and row["gross"] is not None and row["quantity"]:
++        row["price"] = round(abs(row["gross"]) / abs(row["quantity"]), 4)
++    if re.match(r"^(ACHAT|VENTE)", row["operation"], re.I):
++        for k in ("quantity", "price", "gross"):
++            if row[k] is not None:
++                row[k] = abs(row[k])
++    return row
++
++
++def _assign_amounts(operations, amounts):
++    """The amounts are listed after all the operations, in their order, apart from them (debit/credit columns).
++
++    Each amount goes to the first operation still without one that it can belong to: close to its gross when it
++    has one, any cash movement otherwise. Left over operations with a gross fall back on it (fees unknown).
++    """
++    for value in amounts:
++        for op in operations:
++            if op["amount"] is not None or NO_CASH_RE.match(op["operation"]):
++                continue
++            gross = op["gross"]
++            if gross is not None and abs(value - abs(gross)) > max(1.5, 0.03 * abs(gross)):
++                continue
++            op["amount"] = _sign(op["operation"]) * value
++            break
++    for op in operations:
++        if op["amount"] is None and op["gross"] is not None and not NO_CASH_RE.match(op["operation"]):
++            op["amount"] = _sign(op["operation"]) * abs(op["gross"])
++
++
++def parse_avis(html):
++    """Operations of one confirmation page, as dicts (date as ISO string, amount signed: debit < 0 < credit)."""
++    doc = lxml.html.fromstring(html)
++    for el in doc.xpath("//script|//style"):
++        el.drop_tree()
++    rows = []
++    for tr in doc.xpath("//tr"):
++        if tr.xpath(".//tr"):
++            continue  # leaf rows only
++        cells = _cells(tr)
++        if cells:
++            rows.append(cells)
++
++    blocks, amounts, date = [], [], None
++    for cells in rows:
++        first = cells[0][0]
++        if END_RE.match(first):
++            break
++        if len(cells) == 1 and DATE_RE.match(first):
++            date = datetime.strptime(first, "%d/%m/%Y").date().isoformat()
++        elif date is None:
++            continue
++        elif len(cells) == 1 and AMOUNT_RE.match(first):
++            amounts.append(abs(_number(first)))
++        elif _is_label(first):
++            blocks.append((date, [cells]))
++        elif blocks:
++            blocks[-1][1].append(cells)
++
++    operations = [_operation(day, lines) for day, lines in blocks]
++    _assign_amounts(operations, amounts)
++    return operations
 diff --git a/modules/boursedirect/browser.py b/modules/boursedirect/browser.py
 index f08cb1ff3..fdf276d1d 100644
 --- a/modules/boursedirect/browser.py
