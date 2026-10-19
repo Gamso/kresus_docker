@@ -14,6 +14,8 @@ services:
       TZ: ${TZ:-Europe/Paris}
       # Experiment: keep cookies between full Esalia logins (see README, "Esalia")
       ESALIA_KEEP_COOKIES: ${ESALIA_KEEP_COOKIES:-0}
+      # Diagnostic: 1 = the boursedirect module dumps the structure of the trade confirmations page
+      BOURSEDIRECT_PROBE: ${BOURSEDIRECT_PROBE:-0}
     volumes:
       # SQLite database, encryption salt (config.ini), sessions, module exports: back this up
       - kresus-data:/var/lib/kresus

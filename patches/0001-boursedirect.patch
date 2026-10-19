@@ -1,5 +1,5 @@
 diff --git a/modules/boursedirect/browser.py b/modules/boursedirect/browser.py
-index f08cb1ff3..fdf276d1d 100644
+index f08cb1ff3..610ffecd6 100644
 --- a/modules/boursedirect/browser.py
 +++ b/modules/boursedirect/browser.py
 @@ -53,6 +53,8 @@
@@ -11,7 +11,7 @@ index f08cb1ff3..fdf276d1d 100644
      HAS_CREDENTIALS_ONLY = True
  
      login = URL(r"/hub/auth/login", LoginPage)
-@@ -221,12 +223,117 @@ def handle_totp(self):
+@@ -221,12 +223,203 @@ def handle_totp(self):
      def handle_otp_sms(self):
          self.do_twofa_validation(self.otp_sms, self.validate_otp_sms)
  
@@ -109,6 +109,91 @@ index f08cb1ff3..fdf276d1d 100644
 +        except Exception as e:  # the history is a bonus: never break the account list for it
 +            self.logger.warning("export history failed: %s: %s", type(e).__name__, e)
 +
++    def _probe_avis_operes(self, account):
++        """BOURSEDIRECT_PROBE=1: writes the structure of the trade confirmations page (avis d'opéré).
++
++        Diagnostic only, no amounts, names, security labels or ids: the input fields (period selectors), the table
++        headers with their row count, the date range of date columns, the first word of operation-like columns,
++        and the number and masked shape of the document links.
++        """
++        import json
++        import os
++        import re
++        from collections import Counter
++
++        if os.environ.get("BOURSEDIRECT_PROBE") != "1":
++            return
++        try:
++            import lxml.html
++
++            def mask(text):
++                return re.sub(r"\d", "9", text or "")
++
++            def words(el):
++                return " ".join(el.text_content().split())
++
++            def summary(doc):
++                info = {"inputs": [], "tables": [], "links": {"count": 0, "shapes": []}}
++                for el in doc.xpath("//input|//select|//textarea"):
++                    name = el.get("name")
++                    if not name:
++                        continue
++                    kind = el.get("type") or el.tag
++                    item = {"name": name, "type": kind}
++                    if el.tag == "select":
++                        options = el.xpath(".//option")
++                        item["options"] = len(options)  # the account selector holds name and number
++                        if name != "nc":
++                            item["labels"] = [mask(words(o))[:25] for o in options][:20]
++                            item["values"] = [mask(o.get("value"))[:25] for o in options][:20]
++                    else:
++                        value = el.get("value") or ""
++                        if re.fullmatch(r"\d{2}/\d{2}/\d{4}", value) or kind in ("checkbox", "radio", "submit"):
++                            item["value"] = mask(value) if kind not in ("checkbox", "radio", "submit") else value[:25]
++                    info["inputs"].append(item)
++                for table in doc.xpath("//table")[:8]:
++                    heads = [words(th) for th in table.xpath(".//th")]
++                    rows = [tr for tr in table.xpath(".//tr") if tr.xpath("./td")]
++                    if not heads and not rows:
++                        continue
++                    entry = {"headers": heads[:14], "rows": len(rows), "columns": {}}
++                    for idx, head in enumerate(heads[:14]):
++                        cells = []
++                        for tr in rows:
++                            tds = tr.xpath("./td")
++                            if len(tds) > idx:
++                                cells.append(words(tds[idx]))
++                        dates = []
++                        for c in cells:
++                            m = re.fullmatch(r"(\d{2})/(\d{2})/(\d{4}).*", c)
++                            if m:
++                                dates.append("%s-%s-%s" % (m.group(3), m.group(2), m.group(1)))
++                        if dates:
++                            entry["columns"][head or str(idx)] = {"dates": [min(dates), max(dates)], "count": len(dates)}
++                        elif re.search(r"sens|op[ée]ration|nature|type", head, re.I):
++                            entry["columns"][head] = dict(Counter((c.split() or ["?"])[0][:20] for c in cells))
++                    info["tables"].append(entry)
++                hrefs = [a.get("href") for a in doc.xpath("//a[@href]")]
++                docs = [h for h in hrefs if re.search(r"pdf|avis|document|download|telecharg", h, re.I)]
++                info["links"]["count"] = len(docs)
++                info["links"]["shapes"] = sorted({mask(h)[:140] for h in docs})[:10]
++                return info
++
++            out = {}
++            for label, path in (("default", "/priv/new/avis-operes.php"),
++                                ("with_account", "/priv/new/avis-operes.php?nc=%s" % account._select)):
++                try:
++                    resp = self.open(path)
++                    out[label] = {"status": resp.status_code, "url": mask(resp.url)}
++                    out[label].update(summary(lxml.html.fromstring(resp.text)))
++                except Exception as e:
++                    response = getattr(e, "response", None)
++                    out[label] = {"status": getattr(response, "status_code", type(e).__name__)}
++            with open("/var/lib/kresus/boursedirect-avis-probe.json", "w") as f:
++                json.dump(out, f, ensure_ascii=False, indent=1)
++        except Exception as e:
++            self.logger.warning("avis probe failed: %s: %s", type(e).__name__, e)
++
      @need_login
      def iter_accounts(self):
          self.accounts.go()
@@ -126,6 +211,7 @@ index f08cb1ff3..fdf276d1d 100644
              self.page.fill_account(obj=account)
 +            self._export_positions(account)
 +            self._export_history(account)
++            self._probe_avis_operes(account)
              yield account
  
      @need_login
