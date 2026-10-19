@@ -6,7 +6,7 @@ An image that bundles:
 |---|---|
 | **Kresus** | npm release pinned in the Dockerfile (`0.26.0`, build-arg `KRESUS_VERSION`) |
 | **Woob** | https://gitlab.com/woob/woob at the master commit the patches were made against (`3bc0f159c`, build-arg `WOOB_REF`: branch, tag or full SHA) |
-| **Patched modules** | `boursedirect`, `esalia`, `fortuneo`: `patches/0001-*.patch` applied on top of master |
+| **Patched modules** | `boursedirect`, `esalia`, `fortuneo`: one patch per module in `patches/`, applied on top of master |
 | **`bp` module** | the master one, with what its Selenium login needs: Firefox ESR, geckodriver, `selenium` |
 | **Sure bridge** | `sure-bridge/sure-bridge.py`, run every day by the `sure-bridge` service |
 
@@ -61,6 +61,9 @@ patches from your local clone, which must be on the commit you want to build:
 ```bash
 scripts/make-patches.sh /path/to/woob feat/boursedirect-esalia
 ```
+
+It writes one patch per module (`0001-boursedirect.patch`, `0002-esalia.patch`, ...) and none for a module that no
+longer differs from upstream, so a patch can be dropped on its own once upstream has integrated the fix.
 
 ## Image size
 

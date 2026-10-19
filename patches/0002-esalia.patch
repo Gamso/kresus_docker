@@ -1,74 +1,5 @@
-diff --git a/modules/boursedirect/browser.py b/modules/boursedirect/browser.py
-index f08cb1ff3..3ee6f0fc0 100644
---- a/modules/boursedirect/browser.py
-+++ b/modules/boursedirect/browser.py
-@@ -53,6 +53,8 @@
- 
- class BoursedirectBrowser(TwoFactorBrowser):
-     BASEURL = "https://www.boursedirect.fr"
-+    # The legacy /priv/ pages can take longer than Woob's 10 s default to answer right after a fresh login
-+    TIMEOUT = 60.0
-     HAS_CREDENTIALS_ONLY = True
- 
-     login = URL(r"/hub/auth/login", LoginPage)
-@@ -221,12 +223,55 @@ def handle_totp(self):
-     def handle_otp_sms(self):
-         self.do_twofa_validation(self.otp_sms, self.validate_otp_sms)
- 
-+    def _export_positions(self, account):
-+        import json
-+        import os
-+        import time
-+        from decimal import Decimal
-+
-+        def num(v):
-+            return float(v) if isinstance(v, (int, float, Decimal)) else None
-+
-+        try:
-+            out = []
-+            for inv in self.iter_investment(account):
-+                out.append({
-+                    "libelle": str(inv.label) if isinstance(inv.label, str) else None,
-+                    "isin": inv.code if isinstance(inv.code, str) else None,
-+                    "quantite": num(inv.quantity),
-+                    "pru": num(inv.unitprice),
-+                    "cours": num(inv.unitvalue),
-+                    "valeur": num(inv.valuation),
-+                    "plus_value": num(inv.diff),
-+                })
-+            path = "/var/lib/kresus/boursedirect-positions-%s.json" % account.id
-+            with open(path + ".tmp", "w") as f:
-+                json.dump({"date": time.strftime("%Y-%m-%d"), "compte": str(account.id),
-+                           "libelle": str(account.label), "positions": out}, f, ensure_ascii=False, indent=1)
-+            os.replace(path + ".tmp", path)
-+        except Exception as e:
-+            try:
-+                with open("/var/lib/kresus/boursedirect-debug.txt", "a") as f:
-+                    f.write("%s export err=%s: %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), type(e).__name__, e))
-+            except OSError:
-+                pass
-+
-     @need_login
-     def iter_accounts(self):
-         self.accounts.go()
-+        if self.page is None and "legacy-token-expired" in self.url:
-+            # Session restauree mais jeton de l'espace legacy expire : reconnexion
-+            self.do_login()
-+            self.accounts.go()
-+        if self.page is None:
-+            from urllib.parse import urlsplit
-+            u = urlsplit(self.url)
-+            hops = [urlsplit(r.url).path for r in self.response.history]
-+            raise AssertionError("Boursedirect: page inconnue %s%s [%s] via=%s" % (u.netloc, u.path, self.response.status_code, hops))
-         for account in self.page.iter_accounts():
-             self.accounts.go(nc=account._select)
-             self.page.fill_account(obj=account)
-+            self._export_positions(account)
-             yield account
- 
-     @need_login
 diff --git a/modules/esalia/browser.py b/modules/esalia/browser.py
-index c5aede107..1e7468ca8 100644
+index c5aede107..22629897d 100644
 --- a/modules/esalia/browser.py
 +++ b/modules/esalia/browser.py
 @@ -15,6 +15,8 @@
@@ -80,7 +11,7 @@ index c5aede107..1e7468ca8 100644
  from woob.browser import URL
  from woob.tools.url import get_url_param
  from woob_modules.erehsbc.browser import ErehsbcBrowser
-@@ -40,12 +42,466 @@ class EsaliaBrowser(ErehsbcBrowser):
+@@ -40,12 +42,559 @@ class EsaliaBrowser(ErehsbcBrowser):
      )
  
      def build_authentication_params(self):
@@ -530,7 +461,100 @@ index c5aede107..1e7468ca8 100644
 +            os.replace(tmp, "/var/lib/kresus/esalia-positions.json")
 +        except OSError as e:
 +            self.logger.warning("export positions failed: %s", e)
++        try:
++            self._export_history()
++        except Exception as e:  # the history is a bonus: never break the account list for it
++            self.logger.warning("export history failed: %s: %s", type(e).__name__, e)
 +        return accounts
++
++    HISTORY_FILE = "/var/lib/kresus/esalia-history.json"
++    HISTORY_MAX_AGE = 20 * 3600
++
++    def _export_history(self):
++        """Writes the operations (parts bought and sold per fund) and the unit price history of every fund.
++
++        The number of parts held at any date is the sum of the signed parts of the operations up to that date,
++        which matches the current positions. Refreshed when the number of operations changes or once a day.
++        """
++        import json
++        import os
++        import time
++
++        try:
++            with open(self.HISTORY_FILE) as f:
++                previous = json.load(f)
++        except (OSError, ValueError):
++            previous = None
++
++        transactions, offset = [], 0
++        while offset < 1000:
++            page = self._api_get("/transactions" + ("?offset=%d" % offset if offset else ""))
++            if not isinstance(page, list) or not page:
++                break
++            transactions += page
++            offset += len(page)
++            if len(page) < 10:
++                break
++
++        if (
++            previous
++            and previous.get("transaction_count") == len(transactions)
++            and time.time() - previous.get("generated_at", 0) < self.HISTORY_MAX_AGE
++        ):
++            return
++
++        movements, support_hrefs = [], {}
++        for tx in transactions:
++            href = ((tx.get("_links") or {}).get("instructions") or {}).get("href")
++            if not href:
++                continue
++            day = (tx.get("date_comptabilisation") or tx.get("date_creation") or "")[:10]
++            for ins in self._api_get(href) or []:
++                sid = ins.get("id_support")
++                support_href = ((ins.get("_links") or {}).get("support_investissement") or {}).get("href")
++                if sid and support_href:
++                    support_hrefs[sid] = support_href
++                movements.append(
++                    {
++                        "date": day,
++                        "dispositif": ins.get("id_dispositif"),
++                        "support": sid,
++                        "sens": ins.get("sens"),  # SOUSCRIPTION (parts in) or RACHAT (parts out)
++                        "parts": ins.get("nb_parts") or 0,
++                        "amount": (ins.get("montant_net") or {}).get("montant"),
++                        "type": ins.get("type") or tx.get("type"),
++                    }
++                )
++
++        supports = {}
++        for sid, support_href in support_hrefs.items():
++            support = self._api_get(support_href) or {}
++            history_href = ((support.get("_links") or {}).get("historique_valorisations") or {}).get("href")
++            prices = []
++            for point in (self._api_get(history_href) or []) if history_href else []:
++                value = (point.get("valeur_part") or {}).get("montant")
++                if point.get("date_valeur") and value is not None:
++                    prices.append([point["date_valeur"][:10], value])
++            supports[sid] = {
++                "label": support.get("titre"),
++                "isin": support.get("code_isin"),
++                "prices": sorted(prices),
++            }
++
++        tmp = self.HISTORY_FILE + ".tmp"
++        with open(tmp, "w") as f:
++            json.dump(
++                {
++                    "generated_at": time.time(),
++                    "date": time.strftime("%Y-%m-%d"),
++                    "transaction_count": len(transactions),
++                    "movements": sorted(movements, key=lambda m: m["date"]),
++                    "supports": supports,
++                },
++                f,
++                ensure_ascii=False,
++            )
++        os.replace(tmp, self.HISTORY_FILE)
 +
 +    def iter_history(self, *args, **kwargs):
 +        return []
@@ -550,27 +574,3 @@ index c5aede107..1e7468ca8 100644
 +            self.session.cookies.clear()
 +        self._advance(self.init_login())
 +        self._finish_oauth()
-diff --git a/modules/fortuneo/browser.py b/modules/fortuneo/browser.py
-index 79441a496..077ec9724 100644
---- a/modules/fortuneo/browser.py
-+++ b/modules/fortuneo/browser.py
-@@ -550,13 +550,17 @@ def iter_history(self, account):
-         self.location(account._history_link)
- 
-         if self.account_history.is_here():
--            # Checking account: use REST API
-+            # Checking and savings accounts: use REST API
-             account_api_id = self.page.get_account_api_id()
-             if account_api_id:
-                 self.portal_sso.go(headers={"apikey": self.client_id})
-+                params = {"metadata": "true"}
-+                # The CAV (current account) filter drops savings accounts transactions (livret)
-+                if account.type == Account.TYPE_CHECKING:
-+                    params["transactionType"] = "CAV,PENDING"
-                 self.api_transactions.go(
-                     id=account_api_id,
--                    params={"transactionType": "CAV,PENDING", "metadata": "true"},
-+                    params=params,
-                     headers={"apikey": self.client_id},
-                 )
-                 return sorted_transactions(list(self.page.iter_history()))

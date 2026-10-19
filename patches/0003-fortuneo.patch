@@ -1,0 +1,24 @@
+diff --git a/modules/fortuneo/browser.py b/modules/fortuneo/browser.py
+index 79441a496..077ec9724 100644
+--- a/modules/fortuneo/browser.py
++++ b/modules/fortuneo/browser.py
+@@ -550,13 +550,17 @@ def iter_history(self, account):
+         self.location(account._history_link)
+ 
+         if self.account_history.is_here():
+-            # Checking account: use REST API
++            # Checking and savings accounts: use REST API
+             account_api_id = self.page.get_account_api_id()
+             if account_api_id:
+                 self.portal_sso.go(headers={"apikey": self.client_id})
++                params = {"metadata": "true"}
++                # The CAV (current account) filter drops savings accounts transactions (livret)
++                if account.type == Account.TYPE_CHECKING:
++                    params["transactionType"] = "CAV,PENDING"
+                 self.api_transactions.go(
+                     id=account_api_id,
+-                    params={"transactionType": "CAV,PENDING", "metadata": "true"},
++                    params=params,
+                     headers={"apikey": self.client_id},
+                 )
+                 return sorted_transactions(list(self.page.iter_history()))

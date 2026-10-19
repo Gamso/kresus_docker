@@ -1,0 +1,69 @@
+diff --git a/modules/boursedirect/browser.py b/modules/boursedirect/browser.py
+index f08cb1ff3..3ee6f0fc0 100644
+--- a/modules/boursedirect/browser.py
++++ b/modules/boursedirect/browser.py
+@@ -53,6 +53,8 @@
+ 
+ class BoursedirectBrowser(TwoFactorBrowser):
+     BASEURL = "https://www.boursedirect.fr"
++    # The legacy /priv/ pages can take longer than Woob's 10 s default to answer right after a fresh login
++    TIMEOUT = 60.0
+     HAS_CREDENTIALS_ONLY = True
+ 
+     login = URL(r"/hub/auth/login", LoginPage)
+@@ -221,12 +223,55 @@ def handle_totp(self):
+     def handle_otp_sms(self):
+         self.do_twofa_validation(self.otp_sms, self.validate_otp_sms)
+ 
++    def _export_positions(self, account):
++        import json
++        import os
++        import time
++        from decimal import Decimal
++
++        def num(v):
++            return float(v) if isinstance(v, (int, float, Decimal)) else None
++
++        try:
++            out = []
++            for inv in self.iter_investment(account):
++                out.append({
++                    "libelle": str(inv.label) if isinstance(inv.label, str) else None,
++                    "isin": inv.code if isinstance(inv.code, str) else None,
++                    "quantite": num(inv.quantity),
++                    "pru": num(inv.unitprice),
++                    "cours": num(inv.unitvalue),
++                    "valeur": num(inv.valuation),
++                    "plus_value": num(inv.diff),
++                })
++            path = "/var/lib/kresus/boursedirect-positions-%s.json" % account.id
++            with open(path + ".tmp", "w") as f:
++                json.dump({"date": time.strftime("%Y-%m-%d"), "compte": str(account.id),
++                           "libelle": str(account.label), "positions": out}, f, ensure_ascii=False, indent=1)
++            os.replace(path + ".tmp", path)
++        except Exception as e:
++            try:
++                with open("/var/lib/kresus/boursedirect-debug.txt", "a") as f:
++                    f.write("%s export err=%s: %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), type(e).__name__, e))
++            except OSError:
++                pass
++
+     @need_login
+     def iter_accounts(self):
+         self.accounts.go()
++        if self.page is None and "legacy-token-expired" in self.url:
++            # Session restauree mais jeton de l'espace legacy expire : reconnexion
++            self.do_login()
++            self.accounts.go()
++        if self.page is None:
++            from urllib.parse import urlsplit
++            u = urlsplit(self.url)
++            hops = [urlsplit(r.url).path for r in self.response.history]
++            raise AssertionError("Boursedirect: page inconnue %s%s [%s] via=%s" % (u.netloc, u.path, self.response.status_code, hops))
+         for account in self.page.iter_accounts():
+             self.accounts.go(nc=account._select)
+             self.page.fill_account(obj=account)
++            self._export_positions(account)
+             yield account
+ 
+     @need_login
