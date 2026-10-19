@@ -1,10 +1,11 @@
-# docker compose up -d --build
+# docker compose up -d            pulls the published image, or builds it if that version is not published
+# docker compose up -d --build    always builds from this checkout
 # Kresus UI: http://localhost:9876
 name: kresus-docker   # fixed project name: volumes are kresus-docker_kresus-data and kresus-docker_sure-bridge-state
 services:
   kresus:
     build: .
-    image: kresus-woob:local
+    image: ghcr.io/gamso/kresus_docker:${IMAGE_TAG:-1.0.0}
     container_name: kresus
     restart: unless-stopped
     ports:
@@ -25,7 +26,7 @@ services:
       retries: 3
 
   sure-bridge:
-    image: kresus-woob:local
+    image: ghcr.io/gamso/kresus_docker:${IMAGE_TAG:-1.0.0}
     container_name: sure-bridge
     restart: unless-stopped
     depends_on:

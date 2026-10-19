@@ -69,6 +69,20 @@ stage, and npm/yarn, the icon theme and the docs are removed from the final imag
 single-stage build on the full `node` image was 3.1 GB). Firefox ESR, which the `bp` module's Selenium login needs,
 is about 0.5 GB of it with its libraries, so there is no browser-less variant.
 
+## Releases
+
+The image is published to GitHub Container Registry as `ghcr.io/gamso/kresus_docker` by
+`.github/workflows/publish.yml` whenever a version tag is pushed:
+
+```bash
+git tag v1.0.1 && git push origin v1.0.1      # publishes 1.0.1, 1.0 and latest
+```
+
+Pull requests only run a test build. `docker-compose.yml` uses `ghcr.io/gamso/kresus_docker:${IMAGE_TAG:-1.0.0}`;
+set `IMAGE_TAG` in `.env` to pick another version. Number a release whenever the pinned Kresus or Woob version in the
+`Dockerfile` changes. The package is private until you make it public (your GitHub profile → Packages →
+`kresus_docker` → Package settings → Change visibility); only the amd64 architecture is built.
+
 ## Backup
 
 ```bash
