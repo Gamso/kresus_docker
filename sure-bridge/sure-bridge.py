@@ -255,10 +255,14 @@ def pea_rebuild_plan(data, rows):
                 mid = (low + high) / 2
                 low, high = (mid, high) if final_avg(mid) < h["pru"] else (low, mid)
             start_avg = (low + high) / 2
-            if abs(final_avg(start_avg) - h["pru"]) > 0.01:
-                warnings.append("%s: opening average cost does not reproduce today's PRU" % h["nom"])
+        # Compared in every case, also when nothing was held at the start (the buys alone then give the average)
+        replay_avg = final_avg(start_avg) if (q0 > 1e-9 or ops) else h["pru"]
+        if abs(replay_avg - h["pru"]) > max(0.01, 0.002 * h["pru"]):
+            warnings.append("%s: the replay gives an average cost of %.4f EUR, Bourse Direct says PRU %.4f EUR "
+                            "(fees or earlier lots missing from the history): Sure will show another gain for this line"
+                            % (h["nom"], replay_avg, h["pru"]))
         securities[isin] = {"nom": h["nom"], "qty_now": h["qty"], "pru": h["pru"], "qty_start": round(q0, 9),
-                            "avg_start": start_avg}
+                            "avg_start": start_avg, "avg_replay": replay_avg}
 
     flows = sum(e["amount"] * (1 if e["kind"] in ("deposit", "sell") else -1) for e in events)
     cash_start = cash_now - flows
@@ -444,11 +448,11 @@ class Bridge:
         if plan["opening"]:
             print("   opening on %s: deposit %.2f EUR (holdings + %.2f EUR cash)" % (
                 plan["opening"]["day"], plan["opening"]["deposit"], plan["opening"]["cash"]))
-        for e in plan["events"][:15]:
+        for e in plan["events"][:60]:
             what = ("%g x %s" % (e["qty"], plan["securities"][e["isin"]]["nom"][:22])) if "isin" in e else e["label"]
             print("   %s  %-10s %-32s %10.2f EUR" % (e["day"], e["kind"], what, e["amount"]))
-        if len(plan["events"]) > 15:
-            print("   ... %d more" % (len(plan["events"]) - 15))
+        if len(plan["events"]) > 60:
+            print("   ... %d more" % (len(plan["events"]) - 60))
         for w in plan["warnings"]:
             print("WARNING: " + w)
         for e in plan["errors"]:
