@@ -15,6 +15,7 @@ Usage:
     sure-bridge.py sync                 send
 """
 import argparse
+import copy
 import functools
 import glob
 import html
@@ -47,7 +48,10 @@ TICKERS = {
 # tokens, WBETH...) are not sent: their cost stays as cash in the account until they are exchanged for one of these.
 CRYPTO_TICKERS = {"BTC": "CRYPTO:BTC", "ETH": "CRYPTO:ETH", "BNB": "CRYPTO:BNB", "USDC": "CRYPTO:USDC"}
 
-MICRO = 1e-9  # micro-buy used only to hand a unit price to Sure
+MICRO = 1e-9
+# Sure wants a positive price with at most 6 decimals: coins that cost nothing (airdropped tokens exchanged for BTC...)
+# get this one
+CRYPTO_PRICE_MIN = 0.000001  # micro-buy used only to hand a unit price to Sure
 
 LINK_KINDS = ("savings", "checking", "loan")
 
@@ -468,6 +472,11 @@ class Bridge:
         quiet = self.dry and len(days) > 30
         for i, d in enumerate(days):
             last = i == len(days) - 1
+            # the state before the day: saved with the number of operations Sure accepted, so that a failure in the
+            # middle of a day resumes after them instead of sending them twice
+            before = copy.deepcopy(st)
+            progress = st.get("progress") or {}
+            skip = progress.get("done", 0) if progress.get("date") == d["date"] else 0
             sells, buys = [], []
             for asset, ch in d["changes"].items():
                 dq, dc = float(ch["qty"]), float(ch["cost"])
@@ -495,13 +504,18 @@ class Bridge:
                 # never more than Sure holds: a movement the exchange API does not list can leave a few units missing
                 qty = min(-q, st["held"].get(a, 0.0))
                 if qty > 1e-10:
-                    ops.append(("sell", a, qty, max(-c / -q, MICRO)))
+                    ops.append(("sell", a, qty, max(round(-c / -q, 6), CRYPTO_PRICE_MIN)))
             if need > 0:
                 ops.append(("deposit", None, need, None))
-            ops += [("buy", a, q, max(c / q, MICRO)) for a, q, c in buys]
+            ops += [("buy", a, q, max(round(c / q, 6), CRYPTO_PRICE_MIN)) for a, q, c in buys]
             if need < 0:
                 ops.append(("withdrawal", None, -need, None))
-            for kind, asset, q, price in ops:
+            for n, (kind, asset, q, price) in enumerate(ops):
+                if n < skip:  # already accepted by Sure before an interruption
+                    if kind in ("buy", "sell"):
+                        st["held"][asset] = round(st["held"].get(asset, 0.0) + (q if kind == "buy" else -q), 10)
+                    print("Crypto: %s of %s on %s already sent, skipped" % (kind, asset or "EUR", d["date"]))
+                    continue
                 show = not quiet or sent < 8 or (last and kind in ("buy", "sell"))
                 if kind in ("deposit", "withdrawal"):
                     self.post("/api/v1/trades", self.trade(account_id, d["date"], type=kind, amount=round(q, 2)),
@@ -516,6 +530,11 @@ class Bridge:
                     h = st["held"].setdefault(asset, 0.0)
                     st["held"][asset] = round(h + (q if kind == "buy" else -q), 10)
                 sent += 1
+                if n < len(ops) - 1:
+                    self.state["crypto"] = dict(before, progress={"date": d["date"], "done": n + 1})
+                    self.commit()
+                    self.state["crypto"] = st
+            st.pop("progress", None)
             st["cash"] = round(st["cash"] + proceeds - spent + need, 2)
             st["last_day"] = d["date"]
             self.commit()
