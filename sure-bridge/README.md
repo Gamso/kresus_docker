@@ -63,7 +63,9 @@ exchanges netting to their fee. With `SURE_ACCOUNT_CRYPTO` set, the bridge repla
   stands for the cost of the coins not sent (airdropped tokens, WBETH...) until they are exchanged for a sent one;
 - every day is sent: each reward is a buy on its date (the rewards of one coin on one day make one buy).
   `CRYPTO_MIN_EUR=1` makes the additions under 1 EUR wait and add up instead, for fewer trades;
-- today is sent tomorrow, once complete.
+- today is sent tomorrow, once complete;
+- the progress is saved after every operation Sure accepts: if Sure refuses one, the next run starts again from it,
+  without sending twice what was already accepted.
 
 The first send replays the whole history, with its real dates, so that the curve of the account starts at the first
 buy: **the Sure account must be empty** (the bridge refuses otherwise). Afterwards each sync sends the days not sent yet

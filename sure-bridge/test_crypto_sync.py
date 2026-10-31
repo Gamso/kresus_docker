@@ -33,6 +33,7 @@ DAYS = [
 class Sure:
     def __init__(self):
         self.trades, self.holdings, self.other_holdings = [], [], []
+        self.fail_at = None
 
     def handler(self):
         sure = self
@@ -57,7 +58,20 @@ class Sure:
                 return self.reply({"holdings": rows, "pagination": {"total_pages": 1}})
 
             def do_POST(self):
-                sure.trades.append(json.loads(self.rfile.read(int(self.headers["Content-Length"])))["trade"])
+                trade = json.loads(self.rfile.read(int(self.headers["Content-Length"])))["trade"]
+                if sure.fail_at is not None and len(sure.trades) == sure.fail_at:
+                    sure.fail_at = None
+                    data = b'{"error":"validation_failed"}'
+                    self.send_response(422)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
+                if trade["type"] in ("buy", "sell") and not trade.get("price", 0) > 0:
+                    self.send_response(422)
+                    self.end_headers()
+                    return
+                sure.trades.append(trade)
                 self.reply({})
 
         return H
@@ -138,6 +152,38 @@ class CryptoSyncTest(unittest.TestCase):
         self.assertNotIn("ticker", btc)
         eth = [t for t in self.sure.trades if t["type"] == "buy" and t["date"] == "2025-01-03"][0]
         self.assertEqual(eth.get("ticker"), "CRYPTO:ETH")  # not held anywhere: Sure resolves the ticker
+
+    def test_coins_that_cost_nothing(self):
+        # airdropped tokens (cost 0) exchanged for BTC: a positive price all the same, Sure refuses 0
+        DAYS.insert(6, day("2025-01-07", BTC=("0.00000278", 0.0)))
+        try:
+            self.write_export("2025-02-01")
+            trades = self.run_sync()
+        finally:
+            DAYS.pop(6)
+        buy = [t for t in self.sure.trades if t["date"] == "2025-01-07"][0]
+        self.assertEqual((buy["type"], buy["qty"], buy["price"]), ("buy", 2.78e-06, 0.000001))
+        self.assertIn(("buy", 2.78e-06, None, "2025-01-07"), trades)
+
+    def test_resumes_after_a_failure_without_sending_twice(self):
+        # Sure refuses the 4th trade: the buy of the reward of 2025-01-02, after the deposit of that same day
+        self.sure.fail_at = 3
+        with self.assertRaises(RuntimeError):
+            self.run_sync()
+        first = list(self.sure.trades)
+        self.assertEqual([(t["type"], t["date"]) for t in first],
+                         [("deposit", "2025-01-01"), ("buy", "2025-01-01"), ("deposit", "2025-01-02")])
+        self.sure.trades = first  # keep what Sure accepted
+        bridge = self.m.Bridge(False)
+        bridge.sync_crypto("A1")
+        types = [(t["type"], t["date"]) for t in self.sure.trades]
+        # the deposit of 2025-01-02 is not sent again, the buy that failed is; then the rest of the history
+        self.assertEqual(types.count(("deposit", "2025-01-02")), 1)
+        self.assertEqual(types.count(("buy", "2025-01-02")), 1)
+        self.assertEqual(len(self.sure.trades), 9)
+        state = json.load(open(os.environ["SURE_BRIDGE_STATE"]))["crypto"]
+        self.assertNotIn("progress", state)
+        self.assertAlmostEqual(state["held"]["BTC"], 0.0109851, places=9)
 
     def test_first_send_needs_an_empty_account(self):
         self.sure.holdings = [{"security": {"ticker": "CRYPTO:BTC", "id": "S1"}, "qty": "0.01"}]
