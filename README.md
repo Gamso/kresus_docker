@@ -9,6 +9,7 @@ An image that bundles:
 | **Patched modules** | `boursedirect`, `esalia`, `fortuneo`: one patch per module in `patches/`, applied on top of master |
 | **`bp` module** | the master one, with what its Selenium login needs: Firefox ESR, geckodriver, `selenium` |
 | **Sure bridge** | `sure-bridge/sure-bridge.py`, run every day by the `sure-bridge` service |
+| **Crypto ledger** | `crypto-ledger/crypto-ledger.py`: archive of the Binance and Kraken movements, cost per coin, export replayed in Sure by the bridge |
 
 Kresus uses the modules of the embedded Woob checkout directly (`KRESUS_WOOB_SOURCES_LIST` points to
 `file:///opt/woob/modules`): it does not download a module release.
@@ -26,8 +27,9 @@ Kresus UI: http://localhost:9876 (add your bank accesses).
 |---|---|---|
 | `kresus` | Kresus + Woob | volume `kresus-data` (`/var/lib/kresus`): SQLite database, `config.ini` with the encryption salt, sessions, module exports |
 | `sure-bridge` | `sure-bridge.py sync` at `SURE_SYNC_TIME` (07:30 by default) | volume `sure-bridge-state` (what has already been sent); configuration in `config/sure-bridge.env` (outside the image) |
+| | `crypto-ledger.py sync` just before the bridge, in the same service | volume `crypto-ledger` (archive of the exchange movements, see `crypto-ledger/README.md`) |
 
-Both volumes survive `docker compose down` and image rebuilds. **`docker compose down -v` deletes them**:
+The volumes survive `docker compose down` and image rebuilds. **`docker compose down -v` deletes them**:
 back them up first (see below).
 
 ## Sure bridge configuration
@@ -90,10 +92,12 @@ set `IMAGE_TAG` in `.env` to pick another version. Number a release whenever the
 
 ```bash
 docker run --rm -v kresus-docker_kresus-data:/d -v "$PWD":/b alpine tar czf /b/kresus-data.tgz -C /d .
+docker run --rm -v kresus-docker_crypto-ledger:/d -v "$PWD":/b alpine tar czf /b/crypto-ledger.tgz -C /d .
 ```
 
 (Volumes are prefixed with the compose project name `kresus-docker`: see `docker volume ls`.) The salt in `config.ini`
-encrypts the bank credentials: without it the backed-up database is unusable.
+encrypts the bank credentials: without it the backed-up database is unusable. The crypto ledger archive keeps
+movements the exchanges may no longer return: without it, only what they still have can be fetched again.
 
 ## Good to know
 

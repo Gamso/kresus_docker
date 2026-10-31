@@ -96,12 +96,14 @@ RUN ln -s ../lib/node_modules/kresus/bin/kresus.js /usr/local/bin/kresus
 
 # Sure bridge + entrypoint (CRLF stripped in case the files were checked out on Windows)
 COPY sure-bridge/sure-bridge.py /usr/local/bin/sure-bridge.py
+COPY crypto-ledger/crypto-ledger.py /usr/local/bin/crypto-ledger.py
 COPY scripts/entrypoint.sh scripts/sure-bridge-scheduler.sh /usr/local/bin/
-RUN sed -i 's/\r$//' /usr/local/bin/sure-bridge.py /usr/local/bin/*.sh \
- && chmod 755 /usr/local/bin/sure-bridge.py /usr/local/bin/entrypoint.sh /usr/local/bin/sure-bridge-scheduler.sh \
+RUN sed -i 's/\r$//' /usr/local/bin/sure-bridge.py /usr/local/bin/crypto-ledger.py /usr/local/bin/*.sh \
+ && chmod 755 /usr/local/bin/sure-bridge.py /usr/local/bin/crypto-ledger.py /usr/local/bin/entrypoint.sh \
+      /usr/local/bin/sure-bridge-scheduler.sh \
  && useradd -r -m -d /var/lib/kresus -s /bin/bash -u 9001 kresus \
- && mkdir -p /var/lib/sure-bridge \
- && chown -R kresus:kresus /var/lib/kresus /var/lib/sure-bridge /opt/woob
+ && mkdir -p /var/lib/sure-bridge /var/lib/crypto-ledger \
+ && chown -R kresus:kresus /var/lib/kresus /var/lib/sure-bridge /var/lib/crypto-ledger /opt/woob
 
 ENV HOME=/var/lib/kresus \
     NODE_ENV=production \
@@ -116,7 +118,8 @@ ENV HOME=/var/lib/kresus \
 
 # /var/lib/kresus: SQLite database, encryption salt, sessions, positions exported by the modules.
 # /var/lib/sure-bridge: bridge state (what has already been sent to Sure).
-VOLUME ["/var/lib/kresus", "/var/lib/sure-bridge"]
+# /var/lib/crypto-ledger: archive of the crypto exchange movements (crypto-ledger.py).
+VOLUME ["/var/lib/kresus", "/var/lib/sure-bridge", "/var/lib/crypto-ledger"]
 EXPOSE 9876
 USER kresus
 WORKDIR /var/lib/kresus

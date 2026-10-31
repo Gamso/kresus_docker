@@ -1,5 +1,6 @@
 #!/bin/bash
-# Runs `sure-bridge.py sync` once a day at SURE_SYNC_TIME (HH:MM, container TZ).
+# Runs `crypto-ledger.py sync` (if an exchange key is set) then `sure-bridge.py sync` once a day at SURE_SYNC_TIME
+# (HH:MM, container TZ).
 #   SURE_SYNC_TIME=07:30   daily send time
 #   SURE_RUN_ON_START=1    also send once when the container starts
 set -uo pipefail
@@ -11,7 +12,14 @@ if [ ! -s "$ENV_FILE" ]; then
   exec sleep infinity
 fi
 
-run() { echo "[sure-bridge] $(date '+%F %T') sync"; sure-bridge.py sync || echo "[sure-bridge] failed (exit code $?)"; }
+run() {
+  echo "[sure-bridge] $(date '+%F %T') sync"
+  # crypto exchanges first (when a key is set), so that the bridge sends their latest export
+  if grep -Eq '^(BINANCE|KRAKEN)_API_KEY=.+' "$ENV_FILE"; then
+    crypto-ledger.py sync || echo "[sure-bridge] crypto-ledger failed (exit code $?)"
+  fi
+  sure-bridge.py sync || echo "[sure-bridge] failed (exit code $?)"
+}
 
 [ "${SURE_RUN_ON_START:-0}" = "1" ] && run
 while true; do
