@@ -6,6 +6,7 @@ project it runs in the `sure-bridge` service (see the top-level README); the pat
 | Sure account | Source | What is sent |
 |---|---|---|
 | Bourse Direct PEA (Investment, PEA) | `/var/lib/kresus/boursedirect-positions-*.json` | Opening deposit then buys at average cost; afterwards buys (price derived from the average cost), sells, cash adjustment |
+| Crypto (Crypto) | `/var/lib/crypto-ledger/positions.json` (`crypto-ledger.py`) | The history of Binance and Kraken replayed day by day with its real dates, then the new days |
 | Esalia PEE (Investment) | `/var/lib/kresus/esalia-positions.json` | `PEE_MODE=valuation`: one global balance. `PEE_MODE=lines`: one line per fund + micro-buys for the unit price |
 | Fortuneo savings account (Savings) | Kresus API | Daily balance |
 | Fortuneo checking account (Checking) | Kresus API | Transactions (deduplicated via `external_id`) + daily balance |
@@ -49,6 +50,34 @@ transactions). Deleting it makes the bridge send everything again: back it up.
 State keys were renamed from the French version (`livret` → `savings`, `courant` → `checking`, `pret:` → `loan:`).
 Carrying over an old `state.json` resends balances (harmless, they are upserted) and re-checks transactions
 (deduplicated); the PEA and PEE keys are unchanged.
+
+## Crypto
+
+`crypto-ledger.py` (see `crypto-ledger/README.md`) archives the Binance and Kraken movements and writes
+`positions.json`: day by day, the net change of quantity and cost of every coin, the transfers between the two
+exchanges netting to their fee. With `SURE_ACCOUNT_CRYPTO` set, the bridge replays those days in that Sure account:
+
+- coins added: a buy at the cost they were added at (EUR paid, or the cost carried from the coin exchanged for them);
+  coins gone: a sell at the cost they leave with, so that Sure holds the quantities and the cost of the exchanges;
+- a deposit before the buys when the account lacks cash, a withdrawal after the sells when it has too much: the cash
+  stands for the cost of the coins not sent (airdropped tokens, WBETH...) until they are exchanged for a sent one;
+- every day is sent: each reward is a buy on its date (the rewards of one coin on one day make one buy).
+  `CRYPTO_MIN_EUR=1` makes the additions under 1 EUR wait and add up instead, for fewer trades;
+- today is sent tomorrow, once complete.
+
+The first send replays the whole history, with its real dates, so that the curve of the account starts at the first
+buy: **the Sure account must be empty** (the bridge refuses otherwise). Afterwards each sync sends the days not sent yet
+(`crypto.last_day` in `state.json`). The scheduler runs `crypto-ledger.py sync` before the bridge when an exchange key
+is set.
+
+Coins sent: BTC, ETH, BNB, USDC, as the `CRYPTO:BTC`... securities Sure uses for its crypto accounts: when one is held
+in any account (a crypto account synced by Sure, for instance), its id is reused, with its price. Another coin:
+`CRYPTO_TICKER_<COIN>=CRYPTO:<COIN>`. If Sure creates a coin "offline" (no price), fix it with "Edit security" as for
+the PEA. The Sure account is of type Crypto.
+
+```bash
+docker compose run --rm sure-bridge sure-bridge.py sync --dry-run     # the plan, nothing sent
+```
 
 ## PEE history
 
@@ -108,5 +137,5 @@ The command stops with an error, writing nothing, if a security of the history i
 
 ## To do
 
-- Crypto (Kraken): opening buy at the Koinly cost basis, then buys read from the Kraken API (read-only key).
-  Koinly has no public API and Sure has no Koinly connector.
+- Crypto: send a sale for EUR at its real price (today it goes at the cost of the coins sold, so its gain does not
+  show in Sure; there has been none so far).

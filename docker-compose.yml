@@ -44,7 +44,10 @@ services:
       - kresus-data:/var/lib/kresus:ro
       # Bridge state: what has already been sent to Sure
       - sure-bridge-state:/var/lib/sure-bridge
+      # Archive of the crypto exchange movements (crypto-ledger.py): back this up
+      - crypto-ledger:/var/lib/crypto-ledger
 
 volumes:
   kresus-data:
   sure-bridge-state:
+  crypto-ledger:

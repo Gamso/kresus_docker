@@ -2,6 +2,7 @@
 """Kresus/Woob -> Sure bridge.
 
 - Bourse Direct PEA : trades (holdings, average cost, cash) from the export of the boursedirect module.
+- Crypto            : the history of the exchanges (crypto-ledger.py export), replayed day by day as trades.
 - Esalia PEE        : one global valuation, or one line per fund with micro-buys (PEE_MODE).
 - Savings account   : daily balance read from Kresus.
 - Checking account  : Kresus transactions (deduplicated) + daily balance.
@@ -24,12 +25,13 @@ import urllib.error
 import urllib.request
 from datetime import date, timedelta
 
-ENV_FILE = "/etc/sure-bridge.env"
-STATE_FILE = "/var/lib/sure-bridge/state.json"
+ENV_FILE = os.environ.get("SURE_BRIDGE_ENV", "/etc/sure-bridge.env")
+STATE_FILE = os.environ.get("SURE_BRIDGE_STATE", "/var/lib/sure-bridge/state.json")
 ESALIA_FILE = "/var/lib/kresus/esalia-positions.json"
 ESALIA_HISTORY_FILE = "/var/lib/kresus/esalia-history.json"
 BD_GLOB = "/var/lib/kresus/boursedirect-positions-*.json"
 BD_HISTORY = "/var/lib/kresus/boursedirect-history-%s.json"
+CRYPTO_FILE = os.environ.get("CRYPTO_LEDGER_EXPORT", "/var/lib/crypto-ledger/positions.json")
 
 # ISIN -> Sure security (ticker|exchange|provider), only used when the security is not held yet
 TICKERS = {
@@ -39,6 +41,11 @@ TICKERS = {
     "IE0002XZSHO1": "WPEA.PA|XPAR|yahoo_finance",  # iShares MSCI World Swap PEA
     "FR0000120271": "TTE.PA|XPAR|yahoo_finance",   # TotalEnergies
 }
+
+# Crypto asset -> Sure security: the CRYPTO:<coin> securities Sure already uses for crypto accounts (when one is held
+# in any account, its id is used). Another one: CRYPTO_TICKER_<ASSET> in the env file. The other assets (airdropped
+# tokens, WBETH...) are not sent: their cost stays as cash in the account until they are exchanged for one of these.
+CRYPTO_TICKERS = {"BTC": "CRYPTO:BTC", "ETH": "CRYPTO:ETH", "BNB": "CRYPTO:BNB", "USDC": "CRYPTO:USDC"}
 
 MICRO = 1e-9  # micro-buy used only to hand a unit price to Sure
 
@@ -312,7 +319,8 @@ class Bridge:
             save_state(self.state)
 
     def post(self, path, body, label):
-        print(("[dry run] " if self.dry else "") + label)
+        if label:
+            print(("[dry run] " if self.dry else "") + label)
         if not self.dry:
             sure("POST", path, body)
 
@@ -329,7 +337,7 @@ class Bridge:
     # ---- Bourse Direct PEA -------------------------------------------------
 
     def pea_security_ids(self, account_id):
-        """Base symbol (AI, ESE...) -> id of the security actually used in Sure."""
+        """Base symbol (AI, ESE, CRYPTO:BTC...) -> id of the security actually used in Sure."""
         start = (date.today() - timedelta(days=10)).isoformat()
         ids, page = {}, 1
         while True:
@@ -414,6 +422,109 @@ class Bridge:
             print("PEA: no change")
         st.update(positions=cur, cash=round(cash, 2), last_date=day)
         self.commit()
+
+    # ---- Crypto (crypto-ledger) ----------------------------------------------
+
+    @staticmethod
+    def crypto_min_eur():
+        """CRYPTO_MIN_EUR: additions smaller than this (EUR of cost) wait and add up. 0 (default): every day is sent,
+        each reward on its date."""
+        return float(CFG.get("CRYPTO_MIN_EUR") or 0)
+
+    def crypto_ticker(self, asset):
+        return CFG.get("CRYPTO_TICKER_" + asset) or CRYPTO_TICKERS.get(asset)
+
+    def sync_crypto(self, account_id):
+        """Replays the day-by-day changes exported by crypto-ledger.py with their real dates: a buy at the cost of
+        what was added, a sell at the cost of what left, so that Sure holds the quantities and the cost of the
+        exchanges. The first run sends the whole history (the Sure account must be empty); the next ones only the
+        days not sent yet. Today is sent tomorrow, once complete."""
+        try:
+            with open(CRYPTO_FILE) as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            print("Crypto: no crypto-ledger export (positions.json): run crypto-ledger.py sync first")
+            return
+        st = self.state.setdefault("crypto", {"last_day": None, "pending": {}, "other_cost": 0.0, "cash": 0.0,
+                                              "held": {}})
+        days = [d for d in data["days"] if d["date"] < data["date"] and (st["last_day"] is None
+                                                                         or d["date"] > st["last_day"])]
+        if not days:
+            print("Crypto: up to date (%s)" % (st["last_day"] or "nothing to send"))
+            return
+        own = self.pea_security_ids(account_id)
+        if st["last_day"] is None and own:
+            raise RuntimeError("the Sure account already holds %s: the first send replays the whole history, it needs an "
+                               "empty account" % ", ".join(sorted(own)))
+        # the securities held in any account (the crypto accounts of Sure hold CRYPTO:BTC...), this one first
+        sec_ids = {}
+        for acc in sure_accounts():
+            if acc["id"] != account_id and acc.get("account_type") in ("crypto", "investment"):
+                sec_ids.update(self.pea_security_ids(acc["id"]))
+        sec_ids.update(own)
+        print(("[dry run] " if self.dry else "") + "Crypto: %d day(s) to replay, %s .. %s"
+              % (len(days), days[0]["date"], days[-1]["date"]))
+        sent, minimum = 0, self.crypto_min_eur()
+        quiet = self.dry and len(days) > 30
+        for i, d in enumerate(days):
+            last = i == len(days) - 1
+            sells, buys = [], []
+            for asset, ch in d["changes"].items():
+                dq, dc = float(ch["qty"]), float(ch["cost"])
+                if not self.crypto_ticker(asset):
+                    st["other_cost"] += dc
+                    continue
+                p = st["pending"].setdefault(asset, {"qty": 0.0, "cost": 0.0})
+                p["qty"] += dq
+                p["cost"] += dc
+            for asset, p in st["pending"].items():
+                # a sale goes at once; additions under CRYPTO_MIN_EUR wait (none by default)
+                if p["qty"] < -1e-9 or (p["qty"] > 1e-9 and (p["cost"] >= minimum or last)):
+                    (sells if p["qty"] < 0 else buys).append((asset, p["qty"], p["cost"]))
+            for asset, q, c in sells + buys:
+                st["pending"][asset] = {"qty": 0.0, "cost": 0.0}
+            # the cash stands for the cost not held as a sent asset: other assets, small changes still pending
+            target = st["other_cost"] + sum(p["cost"] for p in st["pending"].values())
+            proceeds = sum(-c for _, _, c in sells)
+            spent = sum(c for _, _, c in buys)
+            need = round(target + spent - st["cash"] - proceeds, 2)
+            if abs(need) < 0.01 or (not (sells or buys) and abs(need) < max(minimum, 0.01)):
+                need = 0  # no trade that day: the cash catches up later rather than a deposit of a few cents
+            ops = []
+            for a, q, c in sells:
+                # never more than Sure holds: a movement the exchange API does not list can leave a few units missing
+                qty = min(-q, st["held"].get(a, 0.0))
+                if qty > 1e-10:
+                    ops.append(("sell", a, qty, max(-c / -q, MICRO)))
+            if need > 0:
+                ops.append(("deposit", None, need, None))
+            ops += [("buy", a, q, max(c / q, MICRO)) for a, q, c in buys]
+            if need < 0:
+                ops.append(("withdrawal", None, -need, None))
+            for kind, asset, q, price in ops:
+                show = not quiet or sent < 8 or (last and kind in ("buy", "sell"))
+                if kind in ("deposit", "withdrawal"):
+                    self.post("/api/v1/trades", self.trade(account_id, d["date"], type=kind, amount=round(q, 2)),
+                              "Crypto: %s of %.2f EUR on %s" % (kind, q, d["date"]) if show else None)
+                else:
+                    ticker = self.crypto_ticker(asset)
+                    base = ticker.split("|")[0].split(".")[0].upper()
+                    ident = {"security_id": sec_ids[base]} if base in sec_ids else {"ticker": ticker}
+                    self.post("/api/v1/trades",
+                              self.trade(account_id, d["date"], type=kind, qty=round(q, 8), price=round(price, 6), **ident),
+                              "Crypto: %s of %.8f %s at %.2f EUR on %s" % (kind, q, asset, price, d["date"]) if show else None)
+                    h = st["held"].setdefault(asset, 0.0)
+                    st["held"][asset] = round(h + (q if kind == "buy" else -q), 10)
+                sent += 1
+            st["cash"] = round(st["cash"] + proceeds - spent + need, 2)
+            st["last_day"] = d["date"]
+            self.commit()
+        print(("[dry run] " if self.dry else "") + "Crypto: %d operation(s), held now %s, cash %.2f EUR" % (
+            sent, ", ".join("%.8f %s" % (q, a) for a, q in sorted(st["held"].items()) if q) or "nothing", st["cash"]))
+        for asset, a in sorted(data["assets"].items()):
+            if self.crypto_ticker(asset) and abs(st["held"].get(asset, 0.0) - float(a["qty"])) > 1e-7:
+                print("Crypto: %s held %.8f in Sure, %s in the export (today and changes under %.2f EUR are sent later)"
+                      % (asset, st["held"].get(asset, 0.0), a["qty"], minimum))
 
     # ---- Esalia PEE ----------------------------------------------------------
 
@@ -738,6 +849,7 @@ def main():
     ids = {x["name"].strip().lower(): x["id"] for x in sure_accounts()}
     errors = 0
     tasks = [(key, CFG.get(key), fn) for key, fn in (("SURE_ACCOUNT_PEA", bridge.sync_pea),
+                                                     ("SURE_ACCOUNT_CRYPTO", bridge.sync_crypto),
                                                      ("SURE_ACCOUNT_PEE", bridge.sync_pee),
                                                      ("SURE_ACCOUNT_SAVINGS", bridge.sync_savings),
                                                      ("SURE_ACCOUNT_CHECKING", bridge.sync_checking))]
