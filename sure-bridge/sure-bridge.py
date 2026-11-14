@@ -332,6 +332,15 @@ class Bridge:
     def trade(account_id, day, **fields):
         return {"trade": dict(account_id=account_id, date=day, currency="EUR", **fields)}
 
+    @staticmethod
+    def unchanged(st, amount):
+        """True when the last valuation sent for this account already has this amount, whatever its date.
+
+        Sure keeps the last valuation until a new one is posted, so re-sending the same amount every
+        day only fills the activity with identical "manual balance update" lines."""
+        last = st.get("last")
+        return bool(last) and abs(last[1] - amount) < 0.005
+
     def valuation(self, account_id, amount, day, label, notes=None):
         v = {"account_id": account_id, "amount": amount, "date": day}
         if notes:
@@ -667,8 +676,8 @@ class Bridge:
         total = round(sum(p["valeur"] for p in data["positions"]), 2)
         pv = round(sum(p.get("plus_value") or 0 for p in data["positions"]), 2)
         st = self.state.setdefault("pee", {})
-        if st.get("last") == [data["date"], total]:
-            print("PEE: already up to date (%s)" % data["date"])
+        if self.unchanged(st, total):
+            print("PEE: valuation unchanged (%.2f EUR since %s)" % (total, st["last"][0]))
             return
         self.valuation(account_id, total, data["date"],
                        "PEE: valuation of %.2f EUR on %s (gain %+.2f EUR)" % (total, data["date"], pv),
@@ -760,8 +769,8 @@ class Bridge:
         # Loan: Kresus reports it as negative, Sure expects the outstanding principal as positive
         today, bal = date.today().isoformat(), abs(acc["balance"]) if liability else acc["balance"]
         st = self.state.setdefault(state_key, {})
-        if st.get("last") == [today, bal]:
-            print("%s: already up to date" % tag)
+        if self.unchanged(st, bal):
+            print("%s: balance unchanged (%.2f EUR since %s)" % (tag, bal, st["last"][0]))
             return
         self.valuation(account_id, bal, today, "%s: balance of %.2f EUR on %s" % (tag, bal, today))
         st["last"] = [today, bal]
@@ -810,7 +819,7 @@ class Bridge:
         self.commit()
 
         today, bal = date.today().isoformat(), acc["balance"]
-        if st.get("last") != [today, bal]:
+        if not self.unchanged(st, bal):
             self.valuation(account_id, bal, today, "%s: balance of %.2f EUR on %s" % (tag, bal, today))
             st["last"] = [today, bal]
             self.commit()

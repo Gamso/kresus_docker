@@ -36,7 +36,7 @@ RUN set -eux; \
       | tar -xz -C /usr/local/bin geckodriver; \
     geckodriver --version | head -1
 
-# Woob: master, then our patches (boursedirect, esalia, fortuneo). The build fails if the patches
+# Woob: master, then our patches (boursedirect, esalia, fortuneo, bp). The build fails if the patches
 # no longer apply on this master: regenerate them with scripts/make-patches.sh.
 COPY patches/ /tmp/patches/
 RUN git init -q /opt/woob && cd /opt/woob \

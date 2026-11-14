@@ -1,0 +1,80 @@
+diff --git a/modules/bp/browser.py b/modules/bp/browser.py
+index bfc5a80..de97805 100644
+--- a/modules/bp/browser.py
++++ b/modules/bp/browser.py
+@@ -158,6 +158,8 @@ class BPSeleniumBrowser(SeleniumBrowser):
+     login_page = URL(
+         r"/wsost/OstBrokerWeb/loginform\?TAM_OP=login&ERROR_CODE=0x00000000&"
+         + r"URL=%2Fvoscomptes%2FcanalXHTML%2Fidentif.ea%3Forigin%3Dparticuliers",
++        # The login page is now served by a new application
++        r"/auth/digital-authentification/connexion\?origin=particuliers.*",
+         LoginPageSelenium,
+     )
+     login_message_auth = URL(
+@@ -186,8 +188,16 @@ def do_login(self):
+ 
+         assert self.login_page.is_here()
+         # fill username/password
+-        self.page.do_login()
+-        self.wait_until(NotCondition(IsHereCondition(self.login_page)))
++        validation_requested = self.page.do_login()
++        if validation_requested:
++            self.logger.warning(
++                "The bp module requested a validation on your trusted device (La Banque Postale app)."
++            )
++            # The page keeps the same URL while waiting for the validation: leave Kresus time to get it
++            # (its own timeout for a command is 300 s).
++            self.wait_until(NotCondition(IsHereCondition(self.login_page)), timeout=240)
++        else:
++            self.wait_until(NotCondition(IsHereCondition(self.login_page)))
+         # wait for "Authentification Forte"
+         if self.login_attente_af.is_here():
+             self.logger.warning(
+diff --git a/modules/bp/pages/login.py b/modules/bp/pages/login.py
+index 12e2142..d02c7f3 100644
+--- a/modules/bp/pages/login.py
++++ b/modules/bp/pages/login.py
+@@ -20,6 +20,7 @@
+ import re
+ import time
+ 
++from selenium.common.exceptions import TimeoutException
+ from selenium.webdriver.common.by import By
+ from selenium.webdriver.support import expected_conditions as EC
+ from selenium.webdriver.support.ui import WebDriverWait
+@@ -80,8 +81,11 @@ def do_login(self):
+         idcompte = self.driver.find_element(By.ID, "identifiant")
+         idcompte.send_keys(self.browser.username)
+ 
+-        continuer = self.driver.find_element(By.ID, "btnContinuer")
+-        continuer.click()
++        # The "Continuer" button lost its "btnContinuer" id in the new login page.
++        continuer = self.driver.find_elements(By.ID, "btnContinuer") or self.driver.find_elements(
++            By.XPATH, '//button[@type="submit" and contains(., "Continuer")]'
++        )
++        continuer[0].click()
+ 
+         for c in self.browser.password:
+             btpass = self.driver.find_element(By.XPATH, f'//button[text()="{c}"]')
+@@ -90,6 +94,21 @@ def do_login(self):
+         confirmer = self.driver.find_element(By.ID, "btnConfirmer")
+         confirmer.click()
+ 
++        # The new login page first announces a strong authentication ("Pour plus de sécurité")
++        # and only asks the validation on the trusted device once "Continuer" is clicked.
++        # Return True when the validation was requested.
++        try:
++            WebDriverWait(self.driver, 15).until(
++                lambda driver: "authentifier de façon renforcée" in driver.find_element(By.TAG_NAME, "body").text
++            )
++        except TimeoutException:
++            return False
++        for button in self.driver.find_elements(By.TAG_NAME, "button"):
++            if "Continuer" in (button.text or ""):
++                button.click()
++                return True
++        return False
++
+ 
+ class MessageAuth(SeleniumPage):
+     def on_load(self):
