@@ -8,9 +8,9 @@ project it runs in the `sure-bridge` service (see the top-level README); the pat
 | Bourse Direct PEA (Investment, PEA) | `/var/lib/kresus/boursedirect-positions-*.json` | Opening deposit then buys at average cost; afterwards buys (price derived from the average cost), sells, cash adjustment |
 | Crypto (Crypto) | `/var/lib/crypto-ledger/positions.json` (`crypto-ledger.py`) | The history of Binance and Kraken replayed day by day with its real dates, then the new days |
 | Esalia PEE (Investment) | `/var/lib/kresus/esalia-positions.json` | `PEE_MODE=valuation`: one global balance. `PEE_MODE=lines`: one line per fund + micro-buys for the unit price |
-| Fortuneo savings account (Savings) | Kresus API | Daily balance |
-| Fortuneo checking account (Checking) | Kresus API | Transactions (deduplicated via `external_id`) + daily balance |
-| `SURE_LINK_<n>` (La Banque Postale or any other Kresus bank) | Kresus API | `savings`: daily balance; `checking`: transactions + daily balance; `loan`: daily outstanding principal, as a positive amount |
+| Fortuneo savings account (Savings) | Kresus API | Balance, sent only when it changes |
+| Fortuneo checking account (Checking) | Kresus API | Transactions (deduplicated via `external_id`) + balance (sent only when it changes) |
+| `SURE_LINK_<n>` (La Banque Postale or any other Kresus bank) | Kresus API | `savings`: balance; `checking`: transactions + balance; `loan`: outstanding principal, as a positive amount (balances are sent only when they change) |
 
 ## Designating a Kresus account
 
