@@ -6,7 +6,7 @@ An image that bundles:
 |---|---|
 | **Kresus** | npm release pinned in the Dockerfile (`0.26.0`, build-arg `KRESUS_VERSION`) |
 | **Woob** | https://gitlab.com/woob/woob at the master commit the patches were made against (`3bc0f159c`, build-arg `WOOB_REF`: branch, tag or full SHA) |
-| **Patched modules** | `boursedirect`, `esalia`, `fortuneo`: one patch per module in `patches/`, applied on top of master |
+| **Patched modules** | `boursedirect`, `esalia`, `fortuneo`, `bp`: one patch per module in `patches/`, applied on top of master |
 | **`bp` module** | the master one, with what its Selenium login needs: Firefox ESR, geckodriver, `selenium` |
 | **Sure bridge** | `sure-bridge/sure-bridge.py`, run every day by the `sure-bridge` service |
 | **Crypto ledger** | `crypto-ledger/crypto-ledger.py`: archive of the Binance and Kraken movements, cost per coin, export replayed in Sure by the bridge |

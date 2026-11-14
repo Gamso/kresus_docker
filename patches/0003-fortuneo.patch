@@ -1,8 +1,169 @@
 diff --git a/modules/fortuneo/browser.py b/modules/fortuneo/browser.py
-index 79441a496..077ec9724 100644
+index 79441a4..8f6750b 100644
 --- a/modules/fortuneo/browser.py
 +++ b/modules/fortuneo/browser.py
-@@ -550,13 +550,17 @@ def iter_history(self, account):
+@@ -187,8 +187,10 @@ class FortuneoBrowser(OAuth2PKCEMixin, TwoFactorBrowser):
+ 
+     need_reload_state = None
+     authorization_code_uri = None
++    # Pending SMS strong authentication of the OAuth login (see request_authorization)
++    sca_state = None
+ 
+-    __states__ = ["need_reload_state", "add_recipient_form", "sms_form", "execute_transfer_form"]
++    __states__ = ["need_reload_state", "add_recipient_form", "sms_form", "execute_transfer_form", "sca_state"]
+ 
+     def __init__(self, config, *args, **kwargs):
+         super().__init__(config, *args, **kwargs)
+@@ -213,6 +215,18 @@ def do_login(self):
+         self.authorization_code_uri = self._authorization_code.with_base(self.api_url).build(browser=self)
+         self.ACCESS_TOKEN_URI = self._access_token.with_base(self.api_url).build(browser=self)
+         self.redirect_uri = self.landing_page.build()
++
++        # The OAuth login does not go through TwoFactorBrowser.do_double_authentication:
++        # the SMS answer is read here.
++        code_value = self.config.get("code")
++        code = code_value.get() if code_value is not None else None
++        if code_value is not None:
++            code_value.set(code_value.default)
++        if code and self.sca_state:
++            self.finish_sca(str(code).strip())
++            return
++
++        self.sca_state = None
+         super().do_login()
+ 
+     def init_login(self):
+@@ -282,18 +296,114 @@ def request_authorization(self):
+         location_params = dict(parse_qsl(urlparse(self.url).fragment))
+         self.session_id = location_params["session_id"]
+ 
++        fingerprint = secrets.token_hex(16)
++        try:
++            self.post_authorization_code(self.password, fingerprint)
++        except ClientError as e:
++            self.handle_sca_required(e, fingerprint)
++            raise
++        self.complete_authorization()
++
++    def post_authorization_code(self, password, fingerprint, extra=None):
++        data = {
++            "access_code": self.username,
++            "password": password,
++            "space": "PART",
++            "fingerprint": fingerprint,
++            "fingerprintDetails": json.dumps(
++                {
++                    "navigator": "Firefox",
++                    "language": "fr-FR",
++                    "navigatorPlatform": "Linux x86_64",
++                    "fuseauxHoraire": -60,
++                    "screenResolution": "1920 x 1080",
++                }
++            ),
++        }
++        data.update(extra or {})
+         self.location(
+             self.authorization_code_uri,
+             params={"session_id": self.session_id},
+-            data={"access_code": self.username, "password": self.password, "space": "PART"},
++            data=data,
+             allow_redirects=False,
+         )
++
++    def handle_sca_required(self, error, fingerprint):
++        """Fortuneo answers 403 SCA_REQUESTED when a strong authentication (SMS code) is needed.
++
++        Send the SMS like the website does, then ask the code to the user. The answer comes back
++        in a later login (do_login -> finish_sca): the state (session id, PKCE verifier, cookies) is saved.
++        """
++        response = error.response
++        if response is None or response.status_code != 403:
++            return
++        try:
++            body = response.json()
++        except ValueError:
++            return
++        if body.get("error_code") != "SCA_REQUESTED":
++            return
++
++        medias = body.get("sca_medias") or []
++        if not medias:
++            raise ActionNeeded(
++                "Aucun numéro de téléphone n'est enregistré chez Fortuneo pour valider la connexion par code SMS."
++            )
++        media = medias[0]
++
++        # Do not send an SMS if nobody can answer it (automatic synchronisation).
++        self.check_interactive()
++
++        self.open(
++            "%s/security/operation/otp" % self.api_url,
++            method="POST",
++            json={
++                "operationId": body["operationId"],
++                "valueMedia": media["numero_crypte"],
++                "typeMedia": media["type_media"],
++                "template": "FTOFROTP",
++            },
++            headers={"apikey": self.client_id, "Authorization": "Bearer %s" % body["sca_tmp_token"]},
++        )
++        self.sca_state = {
++            "session_id": self.session_id,
++            "operation_id": body["operationId"],
++            "media_type": media["type_media"],
++            "fingerprint": fingerprint,
++        }
++        raise BrowserQuestion(
++            Value("code", label="Entrez le code reçu par SMS au %s" % media.get("numero_masque", "").strip())
++        )
++
++    def finish_sca(self, code):
++        state = self.sca_state
++        self.sca_state = None
++        self.session_id = state["session_id"]
++        try:
++            self.post_authorization_code(
++                code,
++                state["fingerprint"],
++                extra={"authenticationMethod": state["media_type"], "operationId": state["operation_id"]},
++            )
++        except ClientError:
++            # Wrong or expired code: start again from scratch (new SMS, new question).
++            self.request_authorization()
++            return
++        self.complete_authorization(retry_on_error=True)
++
++    def complete_authorization(self, retry_on_error=False):
+         redirect_uri = self.response.headers.get("Location")
+-        if redirect_uri:
+-            location_params = dict(parse_qsl(urlparse(redirect_uri).fragment))
+-            self.code = location_params["code"]
+-            self.request_access_token({"code": self.code})
+-            self.checkaccess.go(data={})
++        if not redirect_uri:
++            return
++        location_params = dict(parse_qsl(urlparse(redirect_uri).fragment))
++        if "code" not in location_params:
++            if retry_on_error:
++                self.request_authorization()
++                return
++            raise BrowserIncorrectPassword(location_params.get("error_description") or "")
++        self.code = location_params["code"]
++        self.request_access_token({"code": self.code})
++        self.checkaccess.go(data={})
+ 
+     def first_login_step(self):
+         if not self.login_page.is_here():
+@@ -370,7 +480,7 @@ def last_login_step(self):
+ 
+     def load_state(self, state):
+         # reload state only for new recipient and 2fa features
+-        if state.get("need_reload_state") or state.get("sms_form"):
++        if state.get("need_reload_state") or state.get("sms_form") or state.get("sca_state"):
+             # don't use locate browser for add recipient step and 2fa validation
+             state.pop("url", None)
+             super().load_state(state)
+@@ -550,13 +660,17 @@ def iter_history(self, account):
          self.location(account._history_link)
  
          if self.account_history.is_here():

@@ -9,7 +9,7 @@
 set -euo pipefail
 WOOB=${1:?path of the woob clone}
 BRANCH=${2:-feat/boursedirect-esalia}
-MODULES="boursedirect esalia fortuneo"
+MODULES="boursedirect esalia fortuneo bp"
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 OUT=$ROOT/patches
 BASE=$(sed -n 's/^ARG WOOB_REF=//p' "$ROOT/Dockerfile" | head -1)
